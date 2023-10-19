@@ -716,7 +716,7 @@ int main(int argc, char *argv[]) {
     printf("Sum across channels time:\t%lf s\n", (sum_end.tv_sec - sum_start.tv_sec) + (sum_end.tv_usec - sum_start.tv_usec) / 1000000.0);
     printf("Inverse FFT time:\t\t%lf s\n", (ifft_end.tv_sec - ifft_start.tv_sec) + (ifft_end.tv_usec - ifft_start.tv_usec) / 1000000.0);
     printf("Free memory time:\t\t%lf s\n", (free_end.tv_sec - free_start.tv_sec) + (free_end.tv_usec - free_start.tv_usec) / 1000000.0);
-    //printf("\nTotal elapsed time:\t\t%lf s\n", elapsed);
+    printf("\nTotal elapsed time:\t\t%lf s\n", elapsed);
 
 
     return 0;
