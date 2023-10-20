@@ -311,13 +311,44 @@ __global__ void transpose_and_cast_uint8_t_to_padded_float(uint8_t* deviceData_u
 
 static __constant__ float cachedTimeShiftsPerDM[4096];
 
-//__global__ void rotate_spectrum_smem(){
-//}
+__global__ void rotate_spectrum(float2* inputArray, float2* outputArray, long nchans, long nsamps, float DM){
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y;
 
-//__global__ void reassemble_fragments(){
-//}
+    int outputIndex = y * nsamps + x;
 
-void compute_time_shifts(float* timeShifts, float f1, float foff, int nchans, float DM) {
+    if (x < nsamps && y < nchans) {
+        float phase = x * DM * cachedTimeShiftsPerDM[y];
+        float2 input = inputArray[outputIndex];
+        float2 output;
+        float s, c;
+        sincosf(phase, &s, &c);
+        output.x = input.x * c - input.y * s;
+        output.y = input.x * s + input.y * c;
+        outputArray[outputIndex] = output;
+    }
+}
+
+
+__global__ void sum_across_channels(float2* inputArray, float2* outputArray, long nchans, long nsamps){
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+
+    float2 sum;
+    sum.x = 0.0;
+    sum.y = 0.0;
+
+    if (x < nsamps) {
+        for (int y = 0; y < nchans; y++) {
+            float2 value = inputArray[y * nsamps + x];
+            sum.x += value.x;
+            sum.y += value.y;
+        }
+    }
+    
+    outputArray[x] = sum;
+}
+
+void compute_time_shifts(float* timeShifts, float f1, float foff, int nchans, float DM, float FFTbinWidth) {
     for (int i = 0; i < nchans; i++) {
         float f2 = f1 + foff * i;
 
@@ -331,6 +362,7 @@ void compute_time_shifts(float* timeShifts, float f1, float foff, int nchans, fl
 
         // convert to seconds
         timeShifts[i] = - timeShift_ms / 1000.0;
+        timeShifts[i] *= 2.0 * M_PI * FFTbinWidth;
     }
 }
 
@@ -384,13 +416,17 @@ int main(int argc, char *argv[]) {
     // allocate memory on the device
     u_int8_t* deviceData_uint8_t;
     float* deviceData_float;
-    float2* deviceData_float2;
+    float2* deviceData_float2_raw;
+    float2* deviceData_float2_dedispersed;
+    float2* deviceData_float2_single_spectrum;
 
     cudaMalloc((void**)&deviceData_uint8_t, header.dataSize * sizeof(uint8_t));
     cudaMalloc((void**)&deviceData_float, header.nchans * header.paddedLength * sizeof(float));
-    cudaMalloc((void**)&deviceData_float2, ((header.paddedLength/2)+1) * header.nchans * sizeof(float2));
+    cudaMalloc((void**)&deviceData_float2_raw, ((header.paddedLength/2)+1) * header.nchans * sizeof(float2));
+    cudaMalloc((void**)&deviceData_float2_dedispersed, ((header.paddedLength/2)+1) * header.nchans * sizeof(float2));
+    cudaMalloc((void**)&deviceData_float2_single_spectrum, ((header.paddedLength/2)+1) * sizeof(float2));
     cudaMemGetInfo(&availableMemory, &totalMemory);
-    printf("Available memory after first mallocs:\t\t%ld MB\n", availableMemory / 1024 / 1024);
+    printf("\nAvailable memory after first mallocs:\t\t%ld MB\n", availableMemory / 1024 / 1024);
 
     cudaMemset(deviceData_float, 0, header.nchans * header.paddedLength * sizeof(float));
 
@@ -412,7 +448,7 @@ int main(int argc, char *argv[]) {
     // cufft each channel, storing the output in the float2 array
     cufftHandle plan;
     cufftPlan1d(&plan, header.paddedLength, CUFFT_R2C, header.nchans);
-    cufftExecR2C(plan, deviceData_float, deviceData_float2);
+    cufftExecR2C(plan, deviceData_float, deviceData_float2_raw);
     cudaDeviceSynchronize();
     cudaFree(deviceData_float);
     cudaDeviceSynchronize();
@@ -421,19 +457,63 @@ int main(int argc, char *argv[]) {
 
     // compute the time shifts for each channel
     float* timeShifts = (float*) malloc(header.nchans * sizeof(float));
-    compute_time_shifts(timeShifts, header.fch1, header.foff, header.nchans, 1.0);
+    compute_time_shifts(timeShifts, header.fch1, header.foff, header.nchans, 1.0, FFTbinWidth);
     cudaMemcpyToSymbol(cachedTimeShiftsPerDM, timeShifts, header.nchans * sizeof(float));
 
+    float* deviceTimeShifts;
+    cudaMalloc((void**)&deviceTimeShifts, header.nchans * sizeof(float));
+    cudaMemcpy(deviceTimeShifts, timeShifts, header.nchans * sizeof(float), cudaMemcpyHostToDevice);
 
-    
+    float DM = 0;
+    float DM_step = 0.1;
+
+    for (int DM_idx = 0; DM_idx < 1024; DM_idx++){
+        DM += DM_step;
+
+        // time the kernel
+        cudaEvent_t startKernel, stopKernel;
+        cudaEventCreate(&startKernel);
+        cudaEventCreate(&stopKernel);
+        cudaEventRecord(startKernel, 0);
+
+        // rotate the spectrum
+        dim3 dimBlockRotation(1024, 1);
+        dim3 dimGridRotation((header.paddedLength + dimBlockRotation.x - 1) / dimBlockRotation.x, header.nchans);
+        rotate_spectrum<<<dimGridRotation, dimBlockRotation>>>(deviceData_float2_raw, deviceData_float2_dedispersed, header.nchans, header.paddedLength, DM);
+        cudaDeviceSynchronize();
+
+        // stop timing
+        cudaEventRecord(stopKernel, 0);
+        cudaEventSynchronize(stopKernel);
+        float elapsedTime;
+        cudaEventElapsedTime(&elapsedTime, startKernel, stopKernel);
+        printf("\nRotation kernel time:\t\t\t%lf s\n", elapsedTime / 1000.0);
 
 
+        // time the kernel
+        cudaEvent_t startKernel2, stopKernel2;
+        cudaEventCreate(&startKernel2);
+        cudaEventCreate(&stopKernel2);
+        cudaEventRecord(startKernel2, 0);
 
+        // sum across channels
+        dim3 dimBlockSum(1024, 1);
+        dim3 dimGridSum((header.paddedLength + dimBlockSum.x - 1) / dimBlockSum.x);
+        sum_across_channels<<<dimGridSum, dimBlockSum>>>(deviceData_float2_dedispersed, deviceData_float2_single_spectrum, header.nchans, header.paddedLength);
+        cudaDeviceSynchronize();
 
-
+        // stop timing
+        cudaEventRecord(stopKernel2, 0);
+        cudaEventSynchronize(stopKernel2);
+        float elapsedTime2;
+        cudaEventElapsedTime(&elapsedTime2, startKernel2, stopKernel2);
+        printf("Sum kernel time:\t\t\t%lf s\n", elapsedTime2 / 1000.0);
+    }
 
     // free memory
-    cudaFree(deviceData_float2);
+    cudaFree(deviceData_float2_raw);
+    cudaFree(deviceData_float2_dedispersed);
+    cudaFree(deviceData_float2_single_spectrum);
     free(hostFilterbank.data);
     free(timeShifts);
 
