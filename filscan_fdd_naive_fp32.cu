@@ -312,12 +312,15 @@ __global__ void transpose_and_cast_uint8_t_to_padded_float(uint8_t* deviceData_u
 static __constant__ float cachedTimeShiftsPerDM[4096];
 
 __global__ void rotate_spectrum(float2* inputArray, float2* outputArray, long nchans, long nsamps, float DM){
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y;
+    long x = blockIdx.x * blockDim.x + threadIdx.x;
+    long y = blockIdx.y;
 
-    int outputIndex = y * nsamps + x;
+    long outputIndex = y * nsamps + x;
+    //printf("outputIndex: %ld\n", outputIndex);
+    //outputIndex = 0;
 
-    if (x < nsamps && y < nchans) {
+
+    if (x < nsamps-1 && y < nchans-1) {
         float phase = x * DM * cachedTimeShiftsPerDM[y];
         float2 input = inputArray[outputIndex];
         float2 output;
@@ -331,21 +334,23 @@ __global__ void rotate_spectrum(float2* inputArray, float2* outputArray, long nc
 
 
 __global__ void sum_across_channels(float2* inputArray, float2* outputArray, long nchans, long nsamps){
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    long x = blockIdx.x * blockDim.x + threadIdx.x;
+    //x = 0;
 
     float2 sum;
     sum.x = 0.0;
     sum.y = 0.0;
 
     if (x < nsamps) {
-        for (int y = 0; y < nchans; y++) {
+        for (long y = 0; y < nchans; y++) {
             float2 value = inputArray[y * nsamps + x];
             sum.x += value.x;
             sum.y += value.y;
         }
+        outputArray[x] = sum;
     }
     
-    outputArray[x] = sum;
+    
 }
 
 void compute_time_shifts(float* timeShifts, float f1, float foff, int nchans, float DM, float FFTbinWidth) {
@@ -422,11 +427,10 @@ int main(int argc, char *argv[]) {
 
     cudaMalloc((void**)&deviceData_uint8_t, header.dataSize * sizeof(uint8_t));
     cudaMalloc((void**)&deviceData_float, header.nchans * header.paddedLength * sizeof(float));
-    cudaMalloc((void**)&deviceData_float2_raw, ((header.paddedLength/2)+1) * header.nchans * sizeof(float2));
-    cudaMalloc((void**)&deviceData_float2_dedispersed, ((header.paddedLength/2)+1) * header.nchans * sizeof(float2));
-    cudaMalloc((void**)&deviceData_float2_single_spectrum, ((header.paddedLength/2)+1) * sizeof(float2));
     cudaMemGetInfo(&availableMemory, &totalMemory);
     printf("\nAvailable memory after first mallocs:\t\t%ld MB\n", availableMemory / 1024 / 1024);
+
+
 
     cudaMemset(deviceData_float, 0, header.nchans * header.paddedLength * sizeof(float));
 
@@ -445,6 +449,7 @@ int main(int argc, char *argv[]) {
     printf("Available memory after free uint8:\t\t%ld MB\n", availableMemory / 1024 / 1024);
 
 
+    cudaMalloc((void**)&deviceData_float2_raw, ((header.paddedLength/2)+1) * header.nchans * sizeof(float2));
     // cufft each channel, storing the output in the float2 array
     cufftHandle plan;
     cufftPlan1d(&plan, header.paddedLength, CUFFT_R2C, header.nchans);
@@ -454,6 +459,11 @@ int main(int argc, char *argv[]) {
     cudaDeviceSynchronize();
     cudaMemGetInfo(&availableMemory, &totalMemory);
     printf("Available memory after free float:\t\t%ld MB\n", availableMemory / 1024 / 1024);
+    cudaMalloc((void**)&deviceData_float2_dedispersed, ((header.paddedLength/2)+1) * header.nchans * sizeof(float2));
+    cudaMalloc((void**)&deviceData_float2_single_spectrum, ((header.paddedLength/2)+1) * sizeof(float2));
+
+
+
 
     // compute the time shifts for each channel
     float* timeShifts = (float*) malloc(header.nchans * sizeof(float));
@@ -464,8 +474,15 @@ int main(int argc, char *argv[]) {
     cudaMalloc((void**)&deviceTimeShifts, header.nchans * sizeof(float));
     cudaMemcpy(deviceTimeShifts, timeShifts, header.nchans * sizeof(float), cudaMemcpyHostToDevice);
 
+    // get last cuda error
+    error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        printf("CUDA error 1: %s\n", cudaGetErrorString(error));
+        return 1;
+    }
+
     float DM = 0;
-    float DM_step = 0.1;
+    float DM_step = 1;
 
     for (int DM_idx = 0; DM_idx < 1024; DM_idx++){
         DM += DM_step;
@@ -479,7 +496,7 @@ int main(int argc, char *argv[]) {
         // rotate the spectrum
         dim3 dimBlockRotation(1024, 1);
         dim3 dimGridRotation((header.paddedLength + dimBlockRotation.x - 1) / dimBlockRotation.x, header.nchans);
-        rotate_spectrum<<<dimGridRotation, dimBlockRotation>>>(deviceData_float2_raw, deviceData_float2_dedispersed, header.nchans, header.paddedLength, DM);
+        rotate_spectrum<<<dimGridRotation, dimBlockRotation>>>(deviceData_float2_raw, deviceData_float2_dedispersed, (long)header.nchans, (header.paddedLength/2) + 1, DM);
         cudaDeviceSynchronize();
 
         // stop timing
@@ -499,7 +516,7 @@ int main(int argc, char *argv[]) {
         // sum across channels
         dim3 dimBlockSum(1024, 1);
         dim3 dimGridSum((header.paddedLength + dimBlockSum.x - 1) / dimBlockSum.x);
-        sum_across_channels<<<dimGridSum, dimBlockSum>>>(deviceData_float2_dedispersed, deviceData_float2_single_spectrum, header.nchans, header.paddedLength);
+        sum_across_channels<<<dimGridSum, dimBlockSum>>>(deviceData_float2_dedispersed, deviceData_float2_single_spectrum, header.nchans, (header.paddedLength/2)+1);
         cudaDeviceSynchronize();
 
         // stop timing
