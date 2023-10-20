@@ -6,6 +6,9 @@
 #include <cuda_runtime.h>
 #include <cufft.h>
 
+#define ROTATION_SMEM_WIDTH 128
+#define ROTATION_SMEM_HEIGHT 16
+
 struct header {
     const char *fileName;
     long fileSize;
@@ -301,136 +304,85 @@ __global__ void transpose_and_cast_uint8_t_to_padded_float(uint8_t* deviceData_u
     }
 }
 
-__global__ void rotate_spectrum_channelwise(float2* deviceData_float2, int nsamps, float FFTbinWidth, float* timeShifts, int nchans) {
-    __shared__ float smem_timeShifts[4096];
+static __constant__ float cachedTimeShiftsPerDM[4096];
 
-
-    // copy time shifts to shared memory, acknowleding that blockDim.x might be less than nchans
-    int myIndex = threadIdx.x;
-
-    for (int i = 0; i < nchans; i += blockDim.x){
-        if (myIndex + i < nchans){
-            smem_timeShifts[myIndex + i] = timeShifts[myIndex + i];
-        }
+struct SharedMemory2D {
+    float2* data;
+    __device__ float2* operator[](int idx) {
+        return &data[idx * ROTATION_SMEM_WIDTH];
     }
+};
 
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    if (x < nsamps) {
-        for (int y = 0; y < nchans; y++){
-            float2 value = deviceData_float2[y * nsamps + x];
-            float phase = 2.0 * M_PI * FFTbinWidth * smem_timeShifts[y] * x;
-            float2 rotatedValue;
-            float s, c;
-            __sincosf(phase, &s, &c);
-            rotatedValue.x = value.x * c - value.y * s;
-            rotatedValue.y = value.x * s + value.y * c;
-            deviceData_float2[y * nsamps + x] = rotatedValue;
-        }
-    }
-}
+__global__ void rotate_spectrum_smem(float2* deviceData_float2, float2* deviceData_output_float2, long nsamps, float FFTbinWidth, long nchans, float DMstart, float DMstep){
+    //extern __shared__ float2 input[ROTATION_SMEM_HEIGHT][ROTATION_SMEM_WIDTH];   // ROTATION_SMEM_HEIGHT channels, ROTATION_SMEM_WIDTH samples per channel
+    //extern __shared__ float2 output[ROTATION_SMEM_HEIGHT][ROTATION_SMEM_WIDTH];  // ROTATION_SMEM_HEIGHT DMs, ROTATION_SMEM_WIDTH samples per channel
 
-__global__ void sum_across_channels(float2* deviceData_float2, float2* deviceData_float2_summed, int nsamps, int nchans) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    if (x < nsamps) {
-        float2 sum;
-        sum.x = 0.0;
-        sum.y = 0.0;
-        for (int y = 0; y < nchans; y++){
-            float2 value = deviceData_float2[y * nsamps + x];
-            sum.x += value.x;
-            sum.y += value.y;
-        }
-        deviceData_float2_summed[x] = sum;
-    }
-}
+    extern __shared__ float2 sharedMemory[];
 
+    SharedMemory2D input = { &sharedMemory[0] };
+    SharedMemory2D output = { &sharedMemory[ROTATION_SMEM_HEIGHT * ROTATION_SMEM_WIDTH] };  // Offset by the size of the input array
 
-
-__global__ void complexSquaredMagnitudeInPlace(float *deviceArray, long arrayLength) {
-    long globalThreadIndex = blockIdx.x * blockDim.x + threadIdx.x;
-
-    // Calculate the squared magnitude of the complex number pair
-    float real = deviceArray[globalThreadIndex * 2];
-    float complex = deviceArray[globalThreadIndex * 2 + 1];
-    float squaredMagnitude = real * real + complex * complex;
-
-    __syncthreads();
-
-    if (globalThreadIndex < arrayLength) {
-        // Store the squared magnitude in the device array
-        deviceArray[globalThreadIndex] = squaredMagnitude;
-    }
-}
-
-__global__ void pulscan_recursiveBoxcar(float *deviceArray, float2 *deviceMax, long n, int zStepSize, int zMax){
-    extern __shared__ float sharedMemory[];
+    // threadIdx.x = 0 -> ROTATION_SMEM_WIDTH-1
+    // threadIdx.y = 0
     
-    // search array should have block size elements, each float2 will be used as [float, int] rather than [float,float]
-    float2* searchArray = reinterpret_cast<float2*>(sharedMemory);
+    // blockDim.x = ROTATION_SMEM_WIDTH
+    // blockDim.y = 1
 
-    // max array should have block size elements
-    float2* maxArray = reinterpret_cast<float2*>(&sharedMemory[2*blockDim.x]);
+    // gridDim.x = nsamps / ROTATION_SMEM_WIDTH = ((nextPowerOf2/2)+1) / ROTATION_SMEM_WIDTH
+    // gridDim.y = nchans / ROTATION_SMEM_HEIGHT
 
-    // sum array should have block size elements
-    float* sumArray = &sharedMemory[4*blockDim.x];
+    // starting channel = blockIdx.y * ROTATION_SMEM_HEIGHT
 
-    // lookup array should have block size + zMax elements
-    float *lookupArray = &sharedMemory[5*blockDim.x];
+    // copy channel 0 -> ROTATION_SMEM_HEIGHT - 1 data to shared memory, ROTATION_SMEM_WIDTH samples wide
+    int global_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int global_y = blockIdx.y * ROTATION_SMEM_HEIGHT;
 
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;;
-
-    long readIndex = threadIdx.x;
-
-    while (readIndex < blockDim.x + zMax){
-        if (blockIdx.x * blockDim.x + readIndex < n) {
-            lookupArray[readIndex] = deviceArray[blockIdx.x * blockDim.x + readIndex];
-        } else {
-            lookupArray[readIndex] = 0;
+    if (global_x < nsamps && global_y < nchans){
+        for (int y_i = 0; y_i < ROTATION_SMEM_HEIGHT; y_i++){
+            input[y_i][threadIdx.x] = deviceData_float2[(global_y + y_i) * nsamps + global_x];       
         }
-        readIndex += blockDim.x;
+    }
+
+    // set output to 0
+    for (int y_i = 0; y_i < ROTATION_SMEM_HEIGHT; y_i++){
+        output[y_i][threadIdx.x].x = 0.0f;
+        output[y_i][threadIdx.x].y = 0.0f;
     }
 
     __syncthreads();
 
-    // populate the sum array
-    sumArray[threadIdx.x] = 0.0f;
+    float multiplier = 2.0 * M_PI * FFTbinWidth * global_x;
+    float DM;
 
-    // populate the search array
-    searchArray[threadIdx.x].x = sumArray[threadIdx.x];
-    searchArray[threadIdx.x].y = *reinterpret_cast<float*>(&idx);
-
-
-    int outputIndex = 0;
-    // begin boxcar filtering
-    for (int i = 0; i < zMax; i++){
-        __syncthreads();
-        // do the offset sum (boxcar filtering)
-        sumArray[threadIdx.x] = sumArray[threadIdx.x] + lookupArray[threadIdx.x + i];
-
-        if(i % zStepSize == 0){
-            // going to reorder the searchArray, so need to copy the sumArray to the searchArray
-            searchArray[threadIdx.x].x = sumArray[threadIdx.x];
-            searchArray[threadIdx.x].y = *reinterpret_cast<float*>(&idx);
-            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-                if (threadIdx.x < s) {
-                    if(searchArray[threadIdx.x].x < searchArray[threadIdx.x + s].x) {
-                        searchArray[threadIdx.x] = searchArray[threadIdx.x + s];
-                    }
-                }
-                __syncthreads();
+    // initialise rotations
+    // rotate channel 0 -> ROTATION_SMEM_HEIGHT - 1 data in shared memory, ROTATION_SMEM_WIDTH samples wide
+    for (int DM_i = 0; DM_i < ROTATION_SMEM_HEIGHT; DM_i++){
+        DM = DMstart + DM_i * DMstep;
+        if (global_x < nsamps && global_y < nchans){
+            float2 value;
+            float phase;
+            float s, c;
+            for (int y_i = 0; y_i < ROTATION_SMEM_HEIGHT; y_i++){
+                value = input[y_i][threadIdx.x];
+                phase = multiplier * cachedTimeShiftsPerDM[global_y + y_i] * DM;
+                __sincosf(phase, &s, &c);
+                input[y_i][threadIdx.x].x += value.x * c - value.y * s;
+                input[y_i][threadIdx.x].y += value.x * s + value.y * c;
+                output[DM_i][threadIdx.x].x += input[y_i][threadIdx.x].x;
+                output[DM_i][threadIdx.x].y += input[y_i][threadIdx.x].y;
             }
-            
-            if (threadIdx.x == 0) {
-                maxArray[outputIndex] = searchArray[0];
-            }
-            outputIndex++;
         }
     }
 
     __syncthreads();
 
-    if (threadIdx.x < zMax/zStepSize){
-        deviceMax[gridDim.x*threadIdx.x + blockIdx.x] = maxArray[threadIdx.x];
+
+
+    // copy channel 0 -> ROTATION_SMEM_HEIGHT - 1 data from shared memory to global memory, ROTATION_SMEM_WIDTH samples wide
+    if (global_x < nsamps && global_y < nchans){
+        for (int y_i = 0; y_i < ROTATION_SMEM_HEIGHT; y_i++){
+            deviceData_output_float2[(global_y + y_i) * nsamps + global_x] = output[y_i][threadIdx.x];  // overreaching?
+        }
     }
 }
 
@@ -471,22 +423,22 @@ int main(int argc, char *argv[]) {
     struct timeval load_start, load_end;
     gettimeofday(&load_start, NULL);
 
-        printf("%s", filscan_frame);
+    printf("%s", filscan_frame);
 
-        if (argc != 2) {
-            printf("Usage: %s <file_name>\n", argv[0]);
-            return 1;
-        }
+    if (argc != 2) {
+        printf("Usage: %s <file_name>\n", argv[0]);
+        return 1;
+    }
 
 
-        struct header header;
-        readHeader(argv[1], &header);
-        printHeaderStruct(&header);
+    struct header header;
+    readHeader(argv[1], &header);
+    printHeaderStruct(&header);
 
-        struct hostFilterbank hostFilterbank;
-        hostFilterbank.header = header;
-        hostFilterbank.data = (uint8_t*) malloc(header.dataSize * sizeof(uint8_t));
-        readFilterbankData(&header, &hostFilterbank);
+    struct hostFilterbank hostFilterbank;
+    hostFilterbank.header = header;
+    hostFilterbank.data = (uint8_t*) malloc(header.dataSize * sizeof(uint8_t));
+    readFilterbankData(&header, &hostFilterbank);
 
     // end load data timer using gettimeofday()
     gettimeofday(&load_end, NULL);
@@ -499,76 +451,95 @@ int main(int argc, char *argv[]) {
     struct timeval malloc_start, malloc_end;
     gettimeofday(&malloc_start, NULL);
 
-        long nsamps = (long) header.nsamp;
-        long nextPowerOf2 = 1;
-        while (nextPowerOf2 < nsamps) {
-            nextPowerOf2 *= 2;
-        }
-        printf("Next power of 2:\t\t%ld\n", nextPowerOf2);
-        printf("Padded observation time:\t%lf\n", header.tsamp * nextPowerOf2);
-        printf("FFT bin width\t\t\t%lf Hz\n", 1.0 / (header.tsamp * nextPowerOf2));
+    long nsamps = (long) header.nsamp;
+    long nextPowerOf2 = 1;
+    while (nextPowerOf2 < nsamps) {
+        nextPowerOf2 *= 2;
+    }
+    printf("Next power of 2:\t\t%ld\n", nextPowerOf2);
+    printf("Padded observation time:\t%lf\n", header.tsamp * nextPowerOf2);
+    printf("FFT bin width\t\t\t%lf Hz\n", 1.0 / (header.tsamp * nextPowerOf2));
 
-        float FFTbinWidth = 1.0 / (header.tsamp * nextPowerOf2);
+    float FFTbinWidth = 1.0 / (header.tsamp * nextPowerOf2);
 
-        long nchans = (long) header.nchans;
-        long dataLength = nchans * nextPowerOf2;
+    long nchans = (long) header.nchans;
+    long dataLength = nchans * nextPowerOf2;
 
-        printf("Data length:\t\t\t%ld\n", dataLength);
+    printf("Data length:\t\t\t%ld bytes\n", dataLength);
 
-        u_int8_t* deviceData_uint8_t;
-        cudaMalloc((void**)&deviceData_uint8_t, header.dataSize * sizeof(uint8_t));
+    u_int8_t* deviceData_uint8_t;
+    cudaMalloc((void**)&deviceData_uint8_t, header.dataSize * sizeof(uint8_t));
 
-        float* deviceData_float;
-        cudaMalloc((void**)&deviceData_float, dataLength * sizeof(float));
+    float* deviceData_float;
+    cudaMalloc((void**)&deviceData_float, dataLength * sizeof(float));
 
-        // check errors after mallocs
-        cudaError_t error = cudaGetLastError();
-        if(error != cudaSuccess)
-        {
-            // print the CUDA error message and exit
-            printf("CUDA error: %s\n", cudaGetErrorString(error));
-            exit(-1);
-        }
+    // check errors after mallocs
+    cudaError_t error = cudaGetLastError();
+    if(error != cudaSuccess)
+    {
+        // print the CUDA error message and exit
+        printf("device data CUDA error: %s\n", cudaGetErrorString(error));
+        exit(-1);
+    }
 
-        cudaMemset(deviceData_float, 0, dataLength * sizeof(float));
+    cudaMemset(deviceData_float, 0, dataLength * sizeof(float));
 
-        // make a float2 copy of the array for cufft output
-        float2* deviceData_float2;
-        cudaMalloc((void**)&deviceData_float2, ((nextPowerOf2/2)+1) * nchans * sizeof(float2));
+    // make a float2 copy of the array for cufft output
+    float2* deviceData_float2;
+    cudaMalloc((void**)&deviceData_float2, ((nextPowerOf2/2)+1) * nchans * sizeof(float2));
 
-        // make a separate float output array for the rotated data after C2R
-        float* deviceData_float_rotated;
-        cudaMalloc((void**)&deviceData_float_rotated, dataLength * sizeof(float));
-        cudaMemset(deviceData_float_rotated, 0, dataLength * sizeof(float));
-
-
-        float* deviceTimeShifts;
-        cudaMalloc((void**)&deviceTimeShifts, nchans * sizeof(float));
-
-
-        float2* deviceData_float2_summed;
-        cudaMalloc((void**)&deviceData_float2_summed, ((nextPowerOf2/2)+1) * sizeof(float2));
+    error = cudaGetLastError();
+    if(error != cudaSuccess)
+    {
+        // print the CUDA error message and exit
+        printf("float2 CUDA error: %s\n", cudaGetErrorString(error));
+        exit(-1);
+    }
 
 
-        // print memory utilisation statistics
-        size_t free_byte;
-        size_t total_byte;
-        cudaMemGetInfo(&free_byte, &total_byte);
-        double free_db = (double)free_byte;
-        double total_db = (double)total_byte;
-        double used_db = total_db - free_db;
-        printf("\nGPU memory usage:\t\tused = %f, free = %f MB, total = %f MB\n", used_db / 1024.0 / 1024.0, free_db / 1024.0 / 1024.0, total_db / 1024.0 / 1024.0);
+
+
+
+    // print memory utilisation statistics
+    size_t free_byte;
+    size_t total_byte;
+    cudaMemGetInfo(&free_byte, &total_byte);
+    cudaMemGetInfo(&free_byte, &total_byte);
+    double free_db = (double)free_byte;
+    double total_db = (double)total_byte;
+    double used_db = total_db - free_db;
+    printf("\nGPU memory usage:\t\tused = %f, free = %f MB, total = %f MB\n", used_db / 1024.0 / 1024.0, free_db / 1024.0 / 1024.0, total_db / 1024.0 / 1024.0);
+
+
+    float2* deviceData_float2_summed;
+    cudaMalloc((void**)&deviceData_float2_summed, ((nextPowerOf2/2)+1) * sizeof(float2));
+
+    error = cudaGetLastError();
+    if(error != cudaSuccess)
+    {
+        // print the CUDA error message and exit
+        printf("malloc2 CUDA error: %s\n", cudaGetErrorString(error));
+        exit(-1);
+    }
+
 
     // end cuda malloc timer using gettimeofday()
     gettimeofday(&malloc_end, NULL);
-
 
     // start data transfer timer using gettimeofday()
     struct timeval transfer_start, transfer_end;
     gettimeofday(&transfer_start, NULL);
 
-        cudaMemcpy(deviceData_uint8_t, hostFilterbank.data, header.dataSize * sizeof(uint8_t), cudaMemcpyHostToDevice);
-        cudaDeviceSynchronize();
+    cudaMemcpy(deviceData_uint8_t, hostFilterbank.data, header.dataSize * sizeof(uint8_t), cudaMemcpyHostToDevice);
+    cudaDeviceSynchronize();
+
+    error = cudaGetLastError();
+    if(error != cudaSuccess)
+    {
+        // print the CUDA error message and exit
+        printf("H2D CUDA error: %s\n", cudaGetErrorString(error));
+        exit(-1);
+    }
 
     // end data transfer timer using gettimeofday()
     gettimeofday(&transfer_end, NULL);
@@ -577,15 +548,25 @@ int main(int argc, char *argv[]) {
     struct timeval transpose_start, transpose_end;
     gettimeofday(&transpose_start, NULL);
 
-        // transpose and cast
-        // copy into float array where each channel is padded to the next highest power of 2 length and set to 0
+    // transpose and cast
+    // copy into float array where each channel is padded to the next highest power of 2 length and set to 0
 
 
-        dim3 dimBlock(32, 32);
-        dim3 dimGrid((nsamps + dimBlock.x - 1) / dimBlock.x, (nchans + dimBlock.y - 1) / dimBlock.y);
-        transpose_and_cast_uint8_t_to_padded_float<<<dimGrid, dimBlock>>>(deviceData_uint8_t, deviceData_float, nchans, nsamps, nextPowerOf2);
-        cudaDeviceSynchronize();
+    dim3 dimBlock(32, 32);
+    dim3 dimGrid((nsamps + dimBlock.x - 1) / dimBlock.x, (nchans + dimBlock.y - 1) / dimBlock.y);
+    transpose_and_cast_uint8_t_to_padded_float<<<dimGrid, dimBlock>>>(deviceData_uint8_t, deviceData_float, nchans, nsamps, nextPowerOf2);
+    cudaDeviceSynchronize();
+    cudaFree(deviceData_uint8_t);
+    cudaDeviceSynchronize();
 
+    error = cudaGetLastError();
+    if(error != cudaSuccess)
+    {
+        // print the CUDA error message and exit
+        printf("transpose CUDA error: %s\n", cudaGetErrorString(error));
+        exit(-1);
+    }
+        
     // end transpose cast timer using gettimeofday()
     gettimeofday(&transpose_end, NULL);
 
@@ -594,12 +575,22 @@ int main(int argc, char *argv[]) {
     struct timeval fft_start, fft_end;
     gettimeofday(&fft_start, NULL);
 
+    // cufft each channel, storing the output in the float2 array
+    cufftHandle plan;
+    cufftPlan1d(&plan, nextPowerOf2, CUFFT_R2C, nchans);
+    cufftExecR2C(plan, deviceData_float, deviceData_float2);
+    cudaDeviceSynchronize();
+    cudaFree(deviceData_float);
+    cudaDeviceSynchronize();
 
-        // cufft each channel, storing the output in the float2 array
-        cufftHandle plan;
-        cufftPlan1d(&plan, nextPowerOf2, CUFFT_R2C, nchans);
-        cufftExecR2C(plan, deviceData_float, deviceData_float2);
-        cudaDeviceSynchronize();
+    error = cudaGetLastError();
+    if(error != cudaSuccess)
+    {
+        // print the CUDA error message and exit
+        printf("cufft CUDA error: %s\n", cudaGetErrorString(error));
+        exit(-1);
+    }
+
 
     // end FFT timer using gettimeofday()
     gettimeofday(&fft_end, NULL);
@@ -608,96 +599,79 @@ int main(int argc, char *argv[]) {
     struct timeval rotate_start, rotate_end;
     gettimeofday(&rotate_start, NULL);
 
-        // compute the time shifts for each channel
-        float* timeShifts = (float*) malloc(nchans * sizeof(float));
-        compute_time_shifts(timeShifts, header.fch1, header.foff, nchans, 50.0);
+    // compute the time shifts for each channel
+    float* timeShifts = (float*) malloc(nchans * sizeof(float));
+    compute_time_shifts(timeShifts, header.fch1, header.foff, nchans, 1.0);
 
-        // copy the time shifts to the device
-        cudaMemcpy(deviceTimeShifts, timeShifts, nchans * sizeof(float), cudaMemcpyHostToDevice);
+    // copy the time shifts to the device constant memory
+    cudaMemcpyToSymbol(cachedTimeShiftsPerDM, timeShifts, nchans * sizeof(float));
+    
+    error = cudaGetLastError();
+    if(error != cudaSuccess)
+    {
+        // print the CUDA error message and exit
+        printf("symbol CUDA error: %s\n", cudaGetErrorString(error));
+        exit(-1);
+    }
 
-        // rotate the spectrum channelwise
-        int numThreads = 1024;
-        int numBlocks = ((nextPowerOf2/2)+1 + numThreads - 1) / numThreads;
+    float DM = 50;
 
-        // time the kernel with cudaEvent
-        //for (int i = 0; i < 100; i++){
+    // rotate the spectrum channelwise
+    
+    float DMstep = 0.1;
 
-        cudaEvent_t kernelStart, kernelStop;
-        cudaEventCreate(&kernelStart);
-        cudaEventCreate(&kernelStop);
-        cudaEventRecord(kernelStart);
+    dim3 dimBlock2(ROTATION_SMEM_WIDTH, 1);
+    dim3 dimGrid2(((nextPowerOf2/2)+1 + dimBlock2.x - 1) / dimBlock2.x, nchans / ROTATION_SMEM_HEIGHT);
 
-        rotate_spectrum_channelwise<<<numBlocks, numThreads>>>(deviceData_float2, ((nextPowerOf2/2)+1), FFTbinWidth, deviceTimeShifts, nchans);
-        cudaDeviceSynchronize();
+    cudaDeviceSynchronize();
+    // get last cuda error
+    error = cudaGetLastError();
+    if(error != cudaSuccess)
+    {
+        // print the CUDA error message and exit
+        printf("before kernel CUDA error: %s\n", cudaGetErrorString(error));
+        exit(-1);
+    }
 
-        cudaEventRecord(kernelStop);
-        cudaEventSynchronize(kernelStop);
-        float kernelTime;
-        cudaEventElapsedTime(&kernelTime, kernelStart, kernelStop);
-        printf("\nRotation kernel time:\t\t%lf ms\n", kernelTime);
-        //}
+    printf("Launching kernel with arguments:\n");
+    printf("dimGrid2: %d, %d\n", dimGrid2.x, dimGrid2.y);
+    printf("dimBlock2: %d, %d\n", dimBlock2.x, dimBlock2.y);
+    printf("smem: %ld\n", 2 * ROTATION_SMEM_HEIGHT * ROTATION_SMEM_WIDTH * sizeof(float2));
+    printf("deviceData_float2: %p\n", deviceData_float2);
+    printf("deviceData_float2: %p\n", deviceData_float2);
+    printf("((nextPowerOf2/2)+1): %ld\n", ((nextPowerOf2/2)+1));
+    printf("FFTbinWidth: %f\n", FFTbinWidth);
+    printf("nchans: %ld\n", nchans);
+    printf("DM: %f\n", DM);
+    printf("DMstep: %f\n", DMstep);
 
+    cudaFuncSetAttribute(rotate_spectrum_smem, cudaFuncAttributeMaxDynamicSharedMemorySize, 99*1024);
+    rotate_spectrum_smem<<<dimGrid2, dimBlock2, 2 * ROTATION_SMEM_HEIGHT * ROTATION_SMEM_WIDTH * sizeof(float2)>>>(deviceData_float2, deviceData_float2, ((nextPowerOf2/2)+1), FFTbinWidth, nchans, DM, DMstep);
+    cudaDeviceSynchronize();
+    
+    // get last cuda error
+    error = cudaGetLastError();
+    if(error != cudaSuccess)
+    {
+        // print the CUDA error message and exit
+        printf("after kernel CUDA error: %s\n", cudaGetErrorString(error));
+        exit(-1);
+    }
 
     // end rotation timer using gettimeofday()
     gettimeofday(&rotate_end, NULL);
-
-
-    // start sum across channels timer using gettimeofday()
-    struct timeval sum_start, sum_end;
-    gettimeofday(&sum_start, NULL);
-
-        // make device array to hold the summed data (summed across channels)
-
-        int numThreadsSum = 1024;
-        int numBlocksSum = (((nextPowerOf2/2)+1) + numThreadsSum - 1) / numThreadsSum;
-
-
-        //for (int i = 0; i < 100; i++){
-        // measure kernel execution time
-        cudaEvent_t kernelStartSum, kernelStopSum;
-        cudaEventCreate(&kernelStartSum);
-        cudaEventCreate(&kernelStopSum);
-        cudaEventRecord(kernelStartSum);
-        
-        sum_across_channels<<<numBlocksSum, numThreadsSum>>>(deviceData_float2, deviceData_float2_summed, ((nextPowerOf2/2)+1), nchans);
-        cudaDeviceSynchronize();
-
-        cudaEventRecord(kernelStopSum);
-        cudaEventSynchronize(kernelStopSum);
-        float kernelTimeSum;
-        cudaEventElapsedTime(&kernelTimeSum, kernelStartSum, kernelStopSum);
-        printf("Sum kernel time:\t\t%lf ms\n", kernelTimeSum);
-        //}
-
-    // end sum across channels timer using gettimeofday()
-    gettimeofday(&sum_end, NULL);
-    
-
-    // start inverse FFT timer using gettimeofday()
-    struct timeval ifft_start, ifft_end;
-    gettimeofday(&ifft_start, NULL);
-
-        // inverse cufft each channel
-        cufftHandle plan2;
-        cufftPlan1d(&plan2, nextPowerOf2, CUFFT_C2R, nchans);
-        cufftExecC2R(plan2, deviceData_float2, deviceData_float_rotated);
-        cudaDeviceSynchronize();
-
-    // end inverse FFT timer using gettimeofday()
-    gettimeofday(&ifft_end, NULL);
 
     // start free memory timer using gettimeofday()
     struct timeval free_start, free_end;
     gettimeofday(&free_start, NULL);
 
-        // free memory
-        cudaFree(deviceData_uint8_t);
-        cudaFree(deviceData_float);
-        cudaFree(deviceData_float2);
-        cudaFree(deviceData_float_rotated);
-        cudaFree(deviceTimeShifts);
-        free(hostFilterbank.data);
-        free(timeShifts);
+    // free memory
+    cudaFree(deviceData_uint8_t);
+    cudaFree(deviceData_float);
+    cudaFree(deviceData_float2);
+    //cudaFree(deviceTimeShifts);
+    free(hostFilterbank.data);
+    free(timeShifts);
 
     // end free memory timer using gettimeofday()
     gettimeofday(&free_end, NULL);
@@ -709,12 +683,10 @@ int main(int argc, char *argv[]) {
     // print timing statistics
     printf("\nLoad data time:\t\t\t%lf s\n", load_elapsed);
     printf("Malloc time:\t\t\t%lf s\n", (malloc_end.tv_sec - malloc_start.tv_sec) + (malloc_end.tv_usec - malloc_start.tv_usec) / 1000000.0);
-    printf("Data transfer time:\t\t%lf s\n", (transfer_end.tv_sec - transfer_start.tv_sec) + (transfer_end.tv_usec - transfer_start.tv_usec) / 1000000.0);
+    printf("Data transfer time H2D:\t\t%lf s\n", (transfer_end.tv_sec - transfer_start.tv_sec) + (transfer_end.tv_usec - transfer_start.tv_usec) / 1000000.0);
     printf("Transpose and cast time:\t%lf s\n", (transpose_end.tv_sec - transpose_start.tv_sec) + (transpose_end.tv_usec - transpose_start.tv_usec) / 1000000.0);
     printf("FFT time:\t\t\t%lf s\n", (fft_end.tv_sec - fft_start.tv_sec) + (fft_end.tv_usec - fft_start.tv_usec) / 1000000.0);
     printf("Rotation time:\t\t\t%lf s\n", (rotate_end.tv_sec - rotate_start.tv_sec) + (rotate_end.tv_usec - rotate_start.tv_usec) / 1000000.0);
-    printf("Sum across channels time:\t%lf s\n", (sum_end.tv_sec - sum_start.tv_sec) + (sum_end.tv_usec - sum_start.tv_usec) / 1000000.0);
-    printf("Inverse FFT time:\t\t%lf s\n", (ifft_end.tv_sec - ifft_start.tv_sec) + (ifft_end.tv_usec - ifft_start.tv_usec) / 1000000.0);
     printf("Free memory time:\t\t%lf s\n", (free_end.tv_sec - free_start.tv_sec) + (free_end.tv_usec - free_start.tv_usec) / 1000000.0);
     printf("\nTotal elapsed time:\t\t%lf s\n", elapsed);
 
