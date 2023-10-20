@@ -4,3 +4,4 @@ backups/filscan_fdd copy.cu
 a.out
 GMRT_60s_band3.fil
 maxSharedmem
+backups/filscan_fdd copy rotate defrag.cu
