@@ -320,7 +320,7 @@ __global__ void rotate_spectrum(float2* inputArray, float2* outputArray, long nc
     //outputIndex = 0;
 
 
-    if (x < nsamps-1 && y < nchans-1) {
+    if (x < nsamps && y < nchans) {
         float phase = x * DM * cachedTimeShiftsPerDM[y];
         float2 input = inputArray[outputIndex];
         float2 output;
@@ -331,7 +331,6 @@ __global__ void rotate_spectrum(float2* inputArray, float2* outputArray, long nc
         outputArray[outputIndex] = output;
     }
 }
-
 
 __global__ void sum_across_channels(float2* inputArray, float2* outputArray, long nchans, long nsamps){
     long x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -349,9 +348,185 @@ __global__ void sum_across_channels(float2* inputArray, float2* outputArray, lon
         }
         outputArray[x] = sum;
     }
-    
-    
 }
+
+
+__global__ void rotate_spectrum_smem_32_square(
+    float2* inputData, float2* outputData, long nsamps, long nchans, float DMstart, float DMstep
+) {
+    int local_x = threadIdx.x;
+    int local_y = threadIdx.y;
+    int global_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int global_y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // Define constants for thread block dimensions
+    const int BLOCK_DIM_X = 32;
+    const int BLOCK_DIM_Y = 32;
+
+    __shared__ float2 input[BLOCK_DIM_Y][BLOCK_DIM_X];
+    __shared__ float2 intermediate[BLOCK_DIM_Y][BLOCK_DIM_X];
+    __shared__ float2 output[BLOCK_DIM_Y][BLOCK_DIM_X];
+
+    // Load data from global memory to shared memory
+    if (global_x < nsamps && global_y < nchans) {
+        input[local_y][local_x] = inputData[global_y * nsamps + global_x];
+        output[local_y][local_x].x = 0.0f;
+        output[local_y][local_x].y = 0.0f;
+    }
+    __syncthreads();
+
+    float DM = DMstart;
+    for (int DM_idx = 0; DM_idx < BLOCK_DIM_Y; DM_idx++) {
+        float phase = global_x * DM * cachedTimeShiftsPerDM[global_y];
+        float2 input_value = input[local_y][local_x];
+        float s, c;
+        sincosf(phase, &s, &c);
+        intermediate[local_y][local_x].x = input_value.x * c - input_value.y * s;
+        intermediate[local_y][local_x].y = input_value.x * s + input_value.y * c;
+
+        __syncthreads();
+
+        // Hierarchical reduction with loop unrolling
+        if (local_y < 16) {
+            float2 sum = intermediate[local_y][local_x];
+            sum.x += intermediate[local_y + 16][local_x].x;
+            sum.y += intermediate[local_y + 16][local_x].y;
+            intermediate[local_y][local_x] = sum;
+        }
+        __syncthreads();
+
+        if (local_y < 8) {
+            float2 sum = intermediate[local_y][local_x];
+            sum.x += intermediate[local_y + 8][local_x].x;
+            sum.y += intermediate[local_y + 8][local_x].y;
+            intermediate[local_y][local_x] = sum;
+        }
+        __syncthreads();
+
+        // Warp-pruned reduction for the last 8 rows
+        if (local_y < 4) {
+            float2 sum = intermediate[local_y][local_x];
+            sum.x += intermediate[local_y + 4][local_x].x;
+            sum.y += intermediate[local_y + 4][local_x].y;
+            sum.x += intermediate[local_y + 2][local_x].x;
+            sum.y += intermediate[local_y + 2][local_x].y;
+            sum.x += intermediate[local_y + 1][local_x].x;
+            sum.y += intermediate[local_y + 1][local_x].y;
+            intermediate[local_y][local_x] = sum;
+        }
+        __syncthreads();
+
+        // Write to output shared memory array
+        if (local_y == 0) {
+            output[DM_idx][local_x] = intermediate[0][local_x];
+        }
+
+        DM += DMstep;
+    }
+    __syncthreads();
+
+    // Copy data from shared memory to global memory
+    if (global_x < nsamps && global_y < nchans) {
+        outputData[global_y * nsamps + global_x] = output[local_y][local_x];
+    }
+    __syncthreads();
+}
+
+
+
+__global__ void unoptimised_rotate_spectrum_smem_32_square(float2* inputData, float2* outputData, long nsamps, long nchans, float DMstart, float DMstep){
+    int local_x = threadIdx.x;
+    int local_y = threadIdx.y;
+    int global_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int global_y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // blockDim.x = blockDim.y = 32
+
+    __shared__ float2 input[32][32];
+    __shared__ float2 intermediate[32][32];
+    __shared__ float2 output[32][32];
+
+    // copy data from global memory to shared memory
+
+    if (global_x < nsamps && global_y < nchans){
+        input[local_y][local_x] = inputData[global_y * nsamps + global_x];
+    }
+    __syncthreads();
+
+    // set output to 0
+    output[local_y][local_x].x = 0.0f;
+    output[local_y][local_x].y = 0.0f;
+
+    float DM = DMstart;
+    for (int DM_idx = 0; DM_idx < 32; DM_idx++){
+        float phase = global_x * DM * cachedTimeShiftsPerDM[global_y];
+        float2 input_value = input[local_y][local_x];
+        float2 intermediate_value;
+        float s, c;
+        sincosf(phase, &s, &c); 
+        intermediate_value.x = input_value.x * c - input_value.y * s;
+        intermediate_value.y = input_value.x * s + input_value.y * c;
+        intermediate[local_y][local_x] = intermediate_value;
+
+        __syncthreads();
+
+        // Hierarchical reduction across the y axis
+        for (int stride = 16; stride > 0; stride /= 2) {
+            if (local_y < stride) {
+                intermediate[local_y][local_x].x += intermediate[local_y + stride][local_x].x;
+                intermediate[local_y][local_x].y += intermediate[local_y + stride][local_x].y;
+            }
+            __syncthreads();
+        }
+
+        // write to output shared memory array
+        if (local_y == 0){
+            output[DM_idx][local_x] = intermediate[0][local_x];
+        }
+
+        DM += DMstep;
+    }
+
+    __syncthreads();
+    // copy data from shared memory to global memory
+    if (global_x < nsamps && global_y < nchans){
+        outputData[global_y * nsamps + global_x] = output[local_y][local_x];
+    }
+    __syncthreads();
+}
+
+// 4096 channels means 128 blocks of 32 DMs, this kernel should take the Nth DM from each block and sum them
+__global__ void sum_across_channels_smem(float2* inputData, float2* outputData, long nsamps, long nchans){
+    int local_x = threadIdx.x;
+    int local_y = threadIdx.y;
+    int global_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int DM_idx = blockIdx.y;
+
+    // blockDim.x = 8
+    // blockDim.y = 128
+
+    __shared__ float2 input[128][8];
+
+    // copy data from global memory to shared memory
+    if (global_x < nsamps && local_y * 32 < nchans){
+        input[local_y][local_x] = inputData[(local_y * 32 + DM_idx) * nsamps + global_x];
+    }
+
+    // parallel reduction sum across the y axis of input
+    for (int stride = 4; stride > 0; stride /= 2) {
+        if (local_x < stride) {
+            input[local_y][local_x].x += input[local_y][local_x + stride].x;
+            input[local_y][local_x].y += input[local_y][local_x + stride].y;
+        }
+        __syncthreads();
+    }
+
+    // write first row of input to output
+    outputData[DM_idx * nsamps + global_x] = input[0][local_x];
+}
+
+
+
 
 void compute_time_shifts(float* timeShifts, float f1, float foff, int nchans, float DM, float FFTbinWidth) {
     for (int i = 0; i < nchans; i++) {
@@ -481,10 +656,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    float DM = 0;
+    float2* deviceData_float2_dedispersed_block;
+    cudaMalloc((void**)&deviceData_float2_dedispersed_block, ((header.paddedLength/2)+1) * 32 * sizeof(float2));
+
+    float DM = 49;
     float DM_step = 1;
 
-    for (int DM_idx = 0; DM_idx < 1024; DM_idx++){
+    //for (int DM_idx = 0; DM_idx < 8; DM_idx++){
         DM += DM_step;
 
         // time the kernel
@@ -494,10 +672,24 @@ int main(int argc, char *argv[]) {
         cudaEventRecord(startKernel, 0);
 
         // rotate the spectrum
-        dim3 dimBlockRotation(1024, 1);
-        dim3 dimGridRotation((header.paddedLength + dimBlockRotation.x - 1) / dimBlockRotation.x, header.nchans);
-        rotate_spectrum<<<dimGridRotation, dimBlockRotation>>>(deviceData_float2_raw, deviceData_float2_dedispersed, (long)header.nchans, (header.paddedLength/2) + 1, DM);
+        //dim3 dimBlockRotation(1024, 1);
+        //dim3 dimGridRotation(((header.paddedLength/2)+1 + dimBlockRotation.x - 1) / dimBlockRotation.x, header.nchans);
+        //rotate_spectrum<<<dimGridRotation, dimBlockRotation>>>(deviceData_float2_raw, deviceData_float2_dedispersed, (long)header.nchans, (header.paddedLength/2) + 1, DM);
+        //cudaDeviceSynchronize();
+
+        // rotate the spectrum using smem version
+        dim3 dimBlockRotation_smem(32, 32);
+        dim3 dimGridRotation_smem((header.paddedLength + dimBlockRotation_smem.x - 1) / dimBlockRotation_smem.x, (header.nchans + dimBlockRotation_smem.y - 1) / dimBlockRotation_smem.y);
+        rotate_spectrum_smem_32_square<<<dimGridRotation_smem, dimBlockRotation_smem, 3 * 32 * 32 * sizeof(float2)>>>(deviceData_float2_raw, deviceData_float2_dedispersed, (header.paddedLength/2) + 1, header.nchans, DM, DM_step);
         cudaDeviceSynchronize();
+
+        // check cuda error
+        error = cudaGetLastError();
+        if (error != cudaSuccess) {
+            printf("CUDA error 2: %s\n", cudaGetErrorString(error));
+            return 1;
+        }
+
 
         // stop timing
         cudaEventRecord(stopKernel, 0);
@@ -514,9 +706,15 @@ int main(int argc, char *argv[]) {
         cudaEventRecord(startKernel2, 0);
 
         // sum across channels
-        dim3 dimBlockSum(1024, 1);
-        dim3 dimGridSum((header.paddedLength + dimBlockSum.x - 1) / dimBlockSum.x);
-        sum_across_channels<<<dimGridSum, dimBlockSum>>>(deviceData_float2_dedispersed, deviceData_float2_single_spectrum, header.nchans, (header.paddedLength/2)+1);
+        //dim3 dimBlockSum(1024, 1);
+        //dim3 dimGridSum(((header.paddedLength/2)+1 + dimBlockSum.x - 1) / dimBlockSum.x);
+        //sum_across_channels<<<dimGridSum, dimBlockSum>>>(deviceData_float2_dedispersed, deviceData_float2_single_spectrum, header.nchans, (header.paddedLength/2)+1);
+        //cudaDeviceSynchronize();
+
+        // sum across channels using smem version
+        dim3 dimBlockSum_smem(8, 128);
+        dim3 dimGridSum_smem(((header.paddedLength/2)+1 + dimBlockSum_smem.x - 1) / dimBlockSum_smem.x, 32);
+        sum_across_channels_smem<<<dimGridSum_smem, dimBlockSum_smem, 128 * 8 * sizeof(float2)>>>(deviceData_float2_dedispersed, deviceData_float2_dedispersed_block, (header.paddedLength/2)+1, header.nchans);
         cudaDeviceSynchronize();
 
         // stop timing
@@ -525,7 +723,23 @@ int main(int argc, char *argv[]) {
         float elapsedTime2;
         cudaEventElapsedTime(&elapsedTime2, startKernel2, stopKernel2);
         printf("Sum kernel time:\t\t\t%lf s\n", elapsedTime2 / 1000.0);
+    //}
+
+
+    // transfer deviceData_float2_single_spectrum to host and write as csv
+    float2* hostData_float2_single_spectrum = (float2*) malloc(((header.paddedLength/2)+1) * sizeof(float2));
+    cudaMemcpy(hostData_float2_single_spectrum, deviceData_float2_single_spectrum, ((header.paddedLength/2)+1) * sizeof(float2), cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+
+    FILE *fp;
+    fp = fopen("single_spectrum_dedispersed.csv", "w+");
+    for (int i = 0; i < (header.paddedLength/2)+1; i++){
+        fprintf(fp, "%f, %f\n", hostData_float2_single_spectrum[i].x, hostData_float2_single_spectrum[i].y);
     }
+
+
+
+
 
     // free memory
     cudaFree(deviceData_float2_raw);
