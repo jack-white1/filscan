@@ -314,11 +314,7 @@ static __constant__ float cachedTimeShiftsPerDM[4096];
 __global__ void rotate_spectrum(float2* inputArray, float2* outputArray, long nchans, long nsamps, float DM){
     long x = blockIdx.x * blockDim.x + threadIdx.x;
     long y = blockIdx.y;
-
     long outputIndex = y * nsamps + x;
-    //printf("outputIndex: %ld\n", outputIndex);
-    //outputIndex = 0;
-
 
     if (x < nsamps && y < nchans) {
         float phase = x * DM * cachedTimeShiftsPerDM[y];
@@ -334,7 +330,6 @@ __global__ void rotate_spectrum(float2* inputArray, float2* outputArray, long nc
 
 __global__ void sum_across_channels(float2* inputArray, float2* outputArray, long nchans, long nsamps){
     long x = blockIdx.x * blockDim.x + threadIdx.x;
-    //x = 0;
 
     float2 sum;
     sum.x = 0.0;
@@ -431,7 +426,6 @@ __global__ void rotate_spectrum_smem_32_square(
     }
     __syncthreads();
 }
-
 
 
 __global__ void unoptimised_rotate_spectrum_smem_32_square(float2* inputData, float2* outputData, long nsamps, long nchans, float DMstart, float DMstep){
@@ -672,16 +666,37 @@ int main(int argc, char *argv[]) {
         cudaEventRecord(startKernel, 0);
 
         // rotate the spectrum
-        //dim3 dimBlockRotation(1024, 1);
-        //dim3 dimGridRotation(((header.paddedLength/2)+1 + dimBlockRotation.x - 1) / dimBlockRotation.x, header.nchans);
-        //rotate_spectrum<<<dimGridRotation, dimBlockRotation>>>(deviceData_float2_raw, deviceData_float2_dedispersed, (long)header.nchans, (header.paddedLength/2) + 1, DM);
-        //cudaDeviceSynchronize();
+        dim3 dimBlockRotation(1024, 1);
+        dim3 dimGridRotation(((header.paddedLength/2)+1 + dimBlockRotation.x - 1) / dimBlockRotation.x, header.nchans);
+        rotate_spectrum<<<dimGridRotation, dimBlockRotation>>>(deviceData_float2_raw, deviceData_float2_dedispersed, (long)header.nchans, (header.paddedLength/2) + 1, DM);
+        cudaDeviceSynchronize();
+
+        // stop timing
+        cudaEventRecord(stopKernel, 0);
+        cudaEventSynchronize(stopKernel);
+        float elapsedTime;
+        cudaEventElapsedTime(&elapsedTime, startKernel, stopKernel);
+        printf("\nRotation kernel (naive implementation, individual DM) time:\t%lf s\n", elapsedTime / 1000.0);
+
+
+        // time the kernel
+        cudaEvent_t startKernel_smem, stopKernel_smem;
+        cudaEventCreate(&startKernel_smem);
+        cudaEventCreate(&stopKernel_smem);
+        cudaEventRecord(startKernel_smem, 0);
 
         // rotate the spectrum using smem version
         dim3 dimBlockRotation_smem(32, 32);
         dim3 dimGridRotation_smem((header.paddedLength + dimBlockRotation_smem.x - 1) / dimBlockRotation_smem.x, (header.nchans + dimBlockRotation_smem.y - 1) / dimBlockRotation_smem.y);
-        rotate_spectrum_smem_32_square<<<dimGridRotation_smem, dimBlockRotation_smem, 3 * 32 * 32 * sizeof(float2)>>>(deviceData_float2_raw, deviceData_float2_dedispersed, (header.paddedLength/2) + 1, header.nchans, DM, DM_step);
+        unoptimised_rotate_spectrum_smem_32_square<<<dimGridRotation_smem, dimBlockRotation_smem, 3 * 32 * 32 * sizeof(float2)>>>(deviceData_float2_raw, deviceData_float2_dedispersed, (header.paddedLength/2) + 1, header.nchans, DM, DM_step);
         cudaDeviceSynchronize();
+
+        // stop timing
+        cudaEventRecord(stopKernel_smem, 0);
+        cudaEventSynchronize(stopKernel_smem);
+        float elapsedTime_smem;
+        cudaEventElapsedTime(&elapsedTime_smem, startKernel_smem, stopKernel_smem);
+        printf("Rotation kernel (smem implementation, 32 DMs) time:\t\t%lf s\n", elapsedTime_smem / 1000.0);
 
         // check cuda error
         error = cudaGetLastError();
@@ -691,12 +706,7 @@ int main(int argc, char *argv[]) {
         }
 
 
-        // stop timing
-        cudaEventRecord(stopKernel, 0);
-        cudaEventSynchronize(stopKernel);
-        float elapsedTime;
-        cudaEventElapsedTime(&elapsedTime, startKernel, stopKernel);
-        printf("\nRotation kernel time:\t\t\t%lf s\n", elapsedTime / 1000.0);
+
 
 
         // time the kernel
@@ -706,10 +716,23 @@ int main(int argc, char *argv[]) {
         cudaEventRecord(startKernel2, 0);
 
         // sum across channels
-        //dim3 dimBlockSum(1024, 1);
-        //dim3 dimGridSum(((header.paddedLength/2)+1 + dimBlockSum.x - 1) / dimBlockSum.x);
-        //sum_across_channels<<<dimGridSum, dimBlockSum>>>(deviceData_float2_dedispersed, deviceData_float2_single_spectrum, header.nchans, (header.paddedLength/2)+1);
-        //cudaDeviceSynchronize();
+        dim3 dimBlockSum(1024, 1);
+        dim3 dimGridSum(((header.paddedLength/2)+1 + dimBlockSum.x - 1) / dimBlockSum.x);
+        sum_across_channels<<<dimGridSum, dimBlockSum>>>(deviceData_float2_dedispersed, deviceData_float2_single_spectrum, header.nchans, (header.paddedLength/2)+1);
+        cudaDeviceSynchronize();
+
+        // stop timing
+        cudaEventRecord(stopKernel2, 0);
+        cudaEventSynchronize(stopKernel2);
+        float elapsedTime2;
+        cudaEventElapsedTime(&elapsedTime2, startKernel2, stopKernel2);
+        printf("Sum kernel (naive implemtation, single DM) time:\t\t%lf s\n", elapsedTime2 / 1000.0);
+
+        // time the kernel
+        cudaEvent_t startKernel2_smem, stopKernel2_smem;
+        cudaEventCreate(&startKernel2_smem);
+        cudaEventCreate(&stopKernel2_smem);
+        cudaEventRecord(startKernel2_smem, 0);
 
         // sum across channels using smem version
         dim3 dimBlockSum_smem(8, 128);
@@ -718,11 +741,12 @@ int main(int argc, char *argv[]) {
         cudaDeviceSynchronize();
 
         // stop timing
-        cudaEventRecord(stopKernel2, 0);
-        cudaEventSynchronize(stopKernel2);
-        float elapsedTime2;
-        cudaEventElapsedTime(&elapsedTime2, startKernel2, stopKernel2);
-        printf("Sum kernel time:\t\t\t%lf s\n", elapsedTime2 / 1000.0);
+        cudaEventRecord(stopKernel2_smem, 0);
+        cudaEventSynchronize(stopKernel2_smem);
+        float elapsedTime2_smem;
+        cudaEventElapsedTime(&elapsedTime2_smem, startKernel2_smem, stopKernel2_smem);
+        printf("Sum kernel (smem implemtation, 32 DMs) time:\t\t\t%lf s\n", elapsedTime2_smem / 1000.0);
+
     //}
 
 
