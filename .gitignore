@@ -1,12 +1,3 @@
-filscan_fdd
-Pulsar_uGMRT-band3_DM50_1.31072ms_4K_100msP_10sig.fil
 backups/*
-a.out
-GMRT_60s_band3.fil
-maxSharedmem
-backups/filscan_fdd copy rotate defrag.cu
-*.csv
-*.png
-filscan_fdd_bf16
-filscan_fdd_fp32
+python/*
 .gitignore
