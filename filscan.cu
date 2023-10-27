@@ -320,6 +320,42 @@ void compute_time_shifts(double* timeShifts, double f1, double foff, int nchans,
 
 
 
+__global__ void transpose_and_pad_uint8_t(uint8_t* input, uint8_t* output, int nchans, int input_nsamps, int output_nsamps) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x < input_nsamps && y < nchans) {
+        output[y * output_nsamps + x] = input[x * nchans + y];
+        //output[y * output_nsamps + x] = 40;
+    }
+}
+
+static __constant__ int channelCopies[8192];
+static __constant__ int cumulativeChannelCopies[8192];
+
+__global__ void stretch_uint8_t_channels(uint8_t* input, uint8_t* output, int nchans, int nsamps) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    int numCopies = channelCopies[y];
+    int outputRowIndex = cumulativeChannelCopies[y] - channelCopies[y];
+
+    if (x < nsamps && y < nchans) {
+        for (int i = 0; i < numCopies; i++) {
+            output[outputRowIndex * nsamps + x] = input[y * nsamps + x];
+            outputRowIndex++;
+        }
+    }
+}
+
+__global__ void copy_uint8_t_array_to_float(uint8_t* input, float* output, long nchans, long nsamps) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x < nsamps && y < nchans) {
+        output[y * nsamps + x] = (float) input[y * nsamps + x];
+    }
+}
+
 const char* filscan_frame = 
 
 "   ______________ __                    \n"
@@ -352,9 +388,53 @@ int main(int argc, char *argv[]) {
     hostFilterbank.data = (uint8_t*) malloc(header.dataSize * sizeof(uint8_t));
     readFilterbankData(&header, &hostFilterbank);
 
+
+
     printf("Next power of 2:\t\t%ld\n", header.paddedLength);
     printf("Padded observation time:\t%lf\n", header.tsamp * header.paddedLength);
     printf("FFT bin width\t\t\t%lf Hz\n", 1.0 / (header.tsamp * header.paddedLength));
+
+    float FFTbinWidth = 1.0 / (header.tsamp * header.paddedLength);
+
+    printf("Data length:\t\t\t%ld bytes\n", header.nchans * header.paddedLength);
+
+    // allocate memory on the device
+    u_int8_t* deviceData_uint8_t;
+    u_int8_t* deviceData_padded_uint8_t;
+
+    size_t availableMemory, totalMemory;
+
+    cudaMalloc((void**)&deviceData_uint8_t, header.dataSize * sizeof(uint8_t));
+    cudaMalloc((void**)&deviceData_padded_uint8_t, header.nchans * header.paddedLength * sizeof(uint8_t));
+    cudaMemGetInfo(&availableMemory, &totalMemory);
+    printf("\nAvailable memory after first mallocs:\t\t%ld MB\n", availableMemory / 1024 / 1024);
+
+
+
+    // set padded to 0
+    cudaMemset(deviceData_padded_uint8_t, 0, header.nchans * header.paddedLength * sizeof(uint8_t));
+
+    cudaMemcpy(deviceData_uint8_t, hostFilterbank.data, header.dataSize * sizeof(uint8_t), cudaMemcpyHostToDevice);
+    cudaDeviceSynchronize();
+
+
+    // transpose and pad
+    dim3 dimBlock(32, 32);
+    dim3 dimGrid((header.nsamp + dimBlock.x - 1) / dimBlock.x, (header.nchans + dimBlock.y - 1) / dimBlock.y);
+    transpose_and_pad_uint8_t<<<dimGrid, dimBlock>>>(deviceData_uint8_t, deviceData_padded_uint8_t, header.nchans, header.nsamp, header.paddedLength);
+
+    printf("transpose_and_pad_uint8_t kernel called with the following arguments:\n");
+    printf("dimGrid.x:\t\t\t%d\n", dimGrid.x);
+    printf("dimGrid.y:\t\t\t%d\n", dimGrid.y);
+    printf("dimBlock.x:\t\t\t%d\n", dimBlock.x);
+    printf("dimBlock.y:\t\t\t%d\n", dimBlock.y);
+    printf("header.nchans:\t\t\t%d\n", header.nchans);
+    printf("header.nsamp:\t\t\t%ld\n", header.nsamp);
+    printf("header.paddedLength:\t\t%ld\n", header.paddedLength);
+    
+    cudaDeviceSynchronize();
+    cudaMemGetInfo(&availableMemory, &totalMemory);
+    printf("Available memory after free uint8:\t\t%ld MB\n", availableMemory / 1024 / 1024);
 
     // compute the time shifts for each channel
     double* timeShifts = (double*) malloc(header.nchans * sizeof(double));
@@ -369,7 +449,7 @@ int main(int argc, char *argv[]) {
     double* timeShiftDifferences = (double*) malloc((header.nchans-1) * sizeof(double));
     //for (int i = 0; i < header.nchans-1; i++) {
     double gradientRatioSum = 0.0f;
-    int totalExtraChannels = 0;
+    long totalExtraChannels = 0;
     for (int i = 0; i < header.nchans-1; i++) {
         timeShiftDifferences[i] = timeShifts[i+1] - timeShifts[i];
         gradientRatioSum += (timeShiftDifferences[i] / timeShiftDifferences[0])-1;
@@ -380,72 +460,168 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    printf("Total extra channels:\t\t%d\n", totalExtraChannels);
+    int cumulativeNumCopies = 0;
+    int* cumulativeNumCopiesArray = (int*) malloc(header.nchans * sizeof(int));
+    for (int i = 0; i < header.nchans; i++) {
+        cumulativeNumCopies += numCopiesArray[i];
+        cumulativeNumCopiesArray[i] = cumulativeNumCopies;
+    }
 
-    int numChannelsStretched = header.nchans + totalExtraChannels;
-    int numChannelsStretchedPadded = numChannelsStretched;
+
+
+    printf("Total extra channels:\t\t%ld\n", totalExtraChannels);
+
+    long numChannelsStretched = (long)header.nchans + (long)totalExtraChannels;
+    long numChannelsStretchedPadded = numChannelsStretched;
 
     // increase numChannelsStretchedPadded to the next power of 2
-    int nextPowerOf2 = 1;
+    long nextPowerOf2 = 1;
     while (nextPowerOf2 < numChannelsStretchedPadded) {
         nextPowerOf2 *= 2;
     }
     numChannelsStretchedPadded = nextPowerOf2;
 
-    printf("Number of channels stretched:\t%d\n", numChannelsStretched);
-    printf("Number of channels stretched and padded:\t%d\n", numChannelsStretchedPadded);
+    printf("Number of channels stretched:\t%ld\n", numChannelsStretched);
+    printf("Number of channels stretched and padded to next power of 2:\t%ld\n", numChannelsStretchedPadded);
 
-    // transpose the data
-    uint8_t* transposedData = (uint8_t*) malloc(header.nsamp * header.nchans * sizeof(uint8_t));
-    for (int i = 0; i < header.nchans; i++) {
-        for (int j = 0; j < header.nsamp; j++) {
-            transposedData[i * header.nsamp + j] = hostFilterbank.data[j * header.nchans + i];
-        }
+    // allocate memory for the stretched data
+    uint8_t* stretchedData;
+    cudaMalloc((void**)&stretchedData, numChannelsStretchedPadded * header.paddedLength * sizeof(uint8_t));
+    printf("Size of stretched data:\t\t%ld bytes\n", numChannelsStretchedPadded * header.paddedLength * sizeof(uint8_t));
+
+
+    // stretch the channels
+    cudaMemcpyToSymbol(channelCopies, numCopiesArray, header.nchans * sizeof(int));
+    cudaMemcpyToSymbol(cumulativeChannelCopies, cumulativeNumCopiesArray, header.nchans * sizeof(int));
+
+    // get last cuda error, print custom error message for this part of the program
+    error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        printf("CUDA error symbol: %s\n", cudaGetErrorString(error));
+        return 1;
     }
 
-    // replace the data with the transposed data
-    free(hostFilterbank.data);
-    hostFilterbank.data = transposedData;
+    dim3 dimBlock2(1024, 1);
+    dim3 dimGrid2((header.paddedLength + dimBlock2.x - 1) / dimBlock2.x, header.nchans);
+    stretch_uint8_t_channels<<<dimGrid2, dimBlock2>>>(deviceData_padded_uint8_t, stretchedData, header.nchans, header.paddedLength);
 
-    // create a new array to hold the stretched and padded data
-    uint8_t* stretchedPaddedData = (uint8_t*) malloc(header.nsamp * numChannelsStretchedPadded * sizeof(uint8_t));
-    //memset it to zero
-    memset(stretchedPaddedData, 0, header.nsamp * numChannelsStretchedPadded * sizeof(uint8_t));
+    printf("stretch_uint8_t_channels kernel called with the following arguments:\n");
+    printf("dimGrid.x:\t\t\t%d\n", dimGrid2.x);
+    printf("dimGrid.y:\t\t\t%d\n", dimGrid2.y);
+    printf("dimBlock.x:\t\t\t%d\n", dimBlock2.x);
+    printf("dimBlock.y:\t\t\t%d\n", dimBlock2.y);
+    printf("header.nchans:\t\t\t%d\n", header.nchans);
+    printf("header.paddedLength:\t\t%ld\n", header.paddedLength);
 
-    // copy the data into the stretched and padded array, copying each channel the corresponding number of times as in numCopiesArray
-    int stretchedPaddedDataIndex = 0;
-    for (int i = 0; i < header.nchans; i++) {
-        for (int j = 0; j < numCopiesArray[i]; j++) {
-            for (int k = 0; k < header.nsamp; k++) {
-                stretchedPaddedData[stretchedPaddedDataIndex] = hostFilterbank.data[i * header.nsamp + k];
-                stretchedPaddedDataIndex++;
-            }
-        }
+    cudaDeviceSynchronize();
+
+    // get last cuda error, print custom error message for this part of the program
+    error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        printf("CUDA error stretch kernel: %s\n", cudaGetErrorString(error));
+        return 1;
+    }
+    
+
+    // copy stretched data back to host
+    uint8_t* stretchedDataHost = (uint8_t*) malloc(numChannelsStretchedPadded * header.paddedLength * sizeof(uint8_t));
+    cudaMemcpy(stretchedDataHost, stretchedData, numChannelsStretchedPadded * header.paddedLength * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+
+    // get last cuda error
+    error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        printf("CUDA error memcpy: %s\n", cudaGetErrorString(error));
+        return 1;
+    }
+    cudaDeviceSynchronize();
+    cudaDeviceSynchronize();
+
+
+    // copy stretched data to float array
+    float* stretchedDataFloat;
+    cudaMalloc((void**)&stretchedDataFloat, numChannelsStretchedPadded * header.paddedLength * sizeof(float));
+    dim3 dimBlock3(1024, 1);
+    dim3 dimGrid3((header.paddedLength + dimBlock3.x - 1) / dimBlock3.x, numChannelsStretchedPadded);
+    printf("Calling copy_uint8_t_array_to_float kernel with the following arguments:\n");
+    printf("dimGrid.x:\t\t\t%d\n", dimGrid3.x);
+    printf("dimGrid.y:\t\t\t%d\n", dimGrid3.y);
+    printf("dimBlock.x:\t\t\t%d\n", dimBlock3.x);
+    printf("dimBlock.y:\t\t\t%d\n", dimBlock3.y);
+    printf("numChannelsStretchedPadded:\t%ld\n", numChannelsStretchedPadded);
+    printf("header.paddedLength:\t\t%ld\n", header.paddedLength);
+    printf("Maximum index that will be accessed:\t%ld\n", numChannelsStretchedPadded * header.paddedLength);
+
+    copy_uint8_t_array_to_float<<<dimGrid3, dimBlock3>>>(stretchedData, stretchedDataFloat, numChannelsStretchedPadded, header.paddedLength);
+    cudaDeviceSynchronize();
+
+    // get last cuda error
+    error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        printf("CUDA error copy_uint8_t_array_to_float: %s\n", cudaGetErrorString(error));
+        //return 1;
     }
 
-    // write the stretched and padded data to a csv file, in format: channel, time, intensity
-    FILE *csvFile = fopen("stretchedPaddedData.csv", "w");
+    // make output array for 2D FFT of stretchedDataFloat
+    cufftComplex* stretchedDataFFT;
+    cudaMalloc((void**)&stretchedDataFFT, numChannelsStretchedPadded * (1+header.paddedLength/2) * sizeof(cufftComplex));
+
+    // create FFT plan
+    cufftHandle plan;
+    cufftPlan2d(&plan, numChannelsStretchedPadded, header.paddedLength, CUFFT_R2C);
+
+    // execute FFT
+    cufftExecR2C(plan, stretchedDataFloat, stretchedDataFFT);
+
+    // check cuda errors
+    error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        printf("CUDA error cufftExecR2C: %s\n", cudaGetErrorString(error));
+        return 1;
+    }
+
+    // write cumulativeNumCopiesArray and numCopies array to csv
+    FILE *csvFile3 = fopen("numCopies.csv", "w");
+    fprintf(csvFile3, "channel,numCopies,cumulativeNumCopies\n");
+    for (int i = 0; i < header.nchans; i++) {
+        fprintf(csvFile3, "%d,%d,%d\n", i, numCopiesArray[i], cumulativeNumCopiesArray[i]);
+    }
+
+    // write stretched data to csv file in format row, column, value
+    FILE *csvFile = fopen("stretchedData.csv", "w");
     for (int i = 0; i < numChannelsStretchedPadded; i++) {
-        for (int j = 0; j < header.nsamp; j++) {
-            fprintf(csvFile, "%d, %d, %d\n", i, j, stretchedPaddedData[i * header.nsamp + j]);
+        for (int j = 0; j < header.paddedLength; j++) {
+            fprintf(csvFile, "%d,%d,%d\n", i, j, stretchedDataHost[i * header.paddedLength + j]);
         }
     }
 
 
 
+    // write to csv
+    FILE *csvFile1 = fopen("data.csv", "w");
+    for (int i = 0; i < header.nchans; i++) {
+        for (int j = 0; j < header.nsamp; j++) {
+            fprintf(csvFile1, "%d,%d,%d\n", i, j, hostFilterbank.data[i * header.nsamp + j]);
+        }
+    }
 
+    // copy stretchedDataFFT back to host
+    cufftComplex* stretchedDataFFTHost = (cufftComplex*) malloc(numChannelsStretchedPadded * (1+header.paddedLength/2) * sizeof(cufftComplex));
+    cudaMemcpy(stretchedDataFFTHost, stretchedDataFFT, numChannelsStretchedPadded * (1+header.paddedLength/2) * sizeof(cufftComplex), cudaMemcpyDeviceToHost);
 
-
-
-
-
-
-
+    // write stretchedDataFFT to csv file in format row, column, complex magnitude
+    FILE *csvFile4 = fopen("stretchedDataFFT.csv", "w");
+    for (int i = 0; i < numChannelsStretchedPadded; i++) {
+        for (int j = 0; j < (1+header.paddedLength/2); j++) {
+            fprintf(csvFile4, "%d,%d,%lf\n", i, j, sqrt(stretchedDataFFTHost[i * (1+header.paddedLength/2) + j].x * stretchedDataFFTHost[i * (1+header.paddedLength/2) + j].x + stretchedDataFFTHost[i * (1+header.paddedLength/2) + j].y * stretchedDataFFTHost[i * (1+header.paddedLength/2) + j].y));
+        }
+    }
 
 
 
     free(hostFilterbank.data);
     free(timeShifts);
+
+
 
     // stop timing
     gettimeofday(&end, NULL);
