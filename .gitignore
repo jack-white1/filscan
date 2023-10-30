@@ -1,5 +1,7 @@
 backups/*
-python/*
 .gitignore
 GMRT_tobs_60.fil
 single_spectrum_dedispersed.csv
+*.csv
+*.png
+
