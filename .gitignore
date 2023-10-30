@@ -2,3 +2,5 @@ backups/*
 .gitignore
 *.csv
 *.png
+*.fil
+!filterbanks/test.fil

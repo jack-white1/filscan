@@ -558,7 +558,7 @@ int main(int argc, char *argv[]) {
     error = cudaGetLastError();
     if (error != cudaSuccess) {
         printf("CUDA error copy_uint8_t_array_to_float: %s\n", cudaGetErrorString(error));
-        //return 1;
+        return 1;
     }
 
     // make output array for 2D FFT of stretchedDataFloat
@@ -594,8 +594,6 @@ int main(int argc, char *argv[]) {
         }
     }
 
-
-
     // write to csv
     FILE *csvFile1 = fopen("data.csv", "w");
     for (int i = 0; i < header.nchans; i++) {
@@ -618,10 +616,21 @@ int main(int argc, char *argv[]) {
 
 
 
+    // free host memory
     free(hostFilterbank.data);
     free(timeShifts);
+    free(numCopiesArray);
+    free(timeShiftDifferences);
+    free(cumulativeNumCopiesArray);
+    free(stretchedDataHost);
+    free(stretchedDataFFTHost);
 
-
+    // free device memory
+    cudaFree(deviceData_uint8_t);
+    cudaFree(deviceData_padded_uint8_t);
+    cudaFree(stretchedData);
+    cudaFree(stretchedDataFloat);
+    cudaFree(stretchedDataFFT);
 
     // stop timing
     gettimeofday(&end, NULL);

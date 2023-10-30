@@ -43,8 +43,8 @@ ax.plot_surface(x, y, log_image_data_transposed, cmap='viridis', edgecolor='none
 # Set the labels and title
 ax.set_xlabel('X')
 ax.set_ylabel('Y')
-ax.set_zlabel('Intensity')
-ax.set_title('3D Surface Plot of Intensity Data')
+ax.set_zlabel('log Intensity')
+ax.set_title('3D Surface Plot of log Intensity Data')
 
 # Display the plot
 plt.show()
