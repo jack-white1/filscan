@@ -726,7 +726,7 @@ int main(int argc, char *argv[]) {
         cudaEventSynchronize(stopKernel2);
         float elapsedTime2;
         cudaEventElapsedTime(&elapsedTime2, startKernel2, stopKernel2);
-        printf("Sum kernel (naive implemtation, single DM) time:\t\t%lf s\n", elapsedTime2 / 1000.0);
+        printf("Sum kernel (naive implementation, single DM) time:\t\t%lf s\n", elapsedTime2 / 1000.0);
 
         // time the kernel
         cudaEvent_t startKernel2_smem, stopKernel2_smem;
@@ -745,7 +745,7 @@ int main(int argc, char *argv[]) {
         cudaEventSynchronize(stopKernel2_smem);
         float elapsedTime2_smem;
         cudaEventElapsedTime(&elapsedTime2_smem, startKernel2_smem, stopKernel2_smem);
-        printf("Sum kernel (smem implemtation, 32 DMs) time:\t\t\t%lf s\n", elapsedTime2_smem / 1000.0);
+        printf("Sum kernel (smem implementation, 32 DMs) time:\t\t\t%lf s\n", elapsedTime2_smem / 1000.0);
 
     //}
 

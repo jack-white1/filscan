@@ -7,3 +7,5 @@ single_spectrum_dedispersed.csv
 *.fil
 !filterbanks/test.fil
 
+filscan_fdd
+filscan_fdd
