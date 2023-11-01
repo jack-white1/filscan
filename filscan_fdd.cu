@@ -5,9 +5,13 @@
 #include <limits.h>
 #include <cuda_runtime.h>
 #include <cufft.h>
+#include <cuda_fp16.h>
+#include <mma.h>
 
-#define ROTATE_BLOCK_DIM_X 32
-#define ROTATE_BLOCK_DIM_Y 32
+#define ROTATE_BLOCK_DIM_X 16
+#define ROTATE_BLOCK_DIM_Y 16
+
+using namespace nvcuda;
 
 struct header {
     const char *fileName;
@@ -430,6 +434,83 @@ __global__ void rotate_spectrum_smem_32_square(
     __syncthreads();
 }
 
+__global__ void tensor_core_rotate_spectrum_smem_32_square(float2* inputData, float2* outputData, long nsamps, long nchans, float DMstart, float DMstep) {
+    int local_x = threadIdx.x;
+    int local_y = threadIdx.y;
+    int global_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int global_y = blockIdx.y * blockDim.y + threadIdx.y;
+    int first_thread_in_block_x = blockIdx.x * blockDim.x;
+
+    __shared__ float2 output[ROTATE_BLOCK_DIM_Y][ROTATE_BLOCK_DIM_X];
+    __shared__ float2 phase[ROTATE_BLOCK_DIM_Y][ROTATE_BLOCK_DIM_X];
+    __shared__ float timeShiftsArray[ROTATE_BLOCK_DIM_Y][ROTATE_BLOCK_DIM_X];
+    
+    __shared__ half inputReal_half[ROTATE_BLOCK_DIM_Y][ROTATE_BLOCK_DIM_X];
+    __shared__ half inputImag_half[ROTATE_BLOCK_DIM_Y][ROTATE_BLOCK_DIM_X];
+    __shared__ half phasorReal_half[ROTATE_BLOCK_DIM_Y][ROTATE_BLOCK_DIM_X];
+    __shared__ half phasorImag_half[ROTATE_BLOCK_DIM_Y][ROTATE_BLOCK_DIM_X];
+
+    if (global_x < nsamps && global_y < nchans) {
+        inputReal_half[local_y][local_x] = __float2half(inputData[global_y * nsamps + global_x].x);
+        inputImag_half[local_y][local_x] = __float2half(inputData[global_y * nsamps + global_x].y);
+    }
+    
+    output[local_y][local_x].x = 0.0f;
+    output[local_y][local_x].y = 0.0f;
+
+    if (local_x == 0 && local_y == 0) {
+        for(int i = 0; i < ROTATE_BLOCK_DIM_Y; i++) {
+            for(int j = 0; j < ROTATE_BLOCK_DIM_X; j++) {
+                timeShiftsArray[i][j] = first_thread_in_block_x * (DMstart + j * DMstep) * cachedTimeShiftsPerDM[global_y + i];
+            }
+        }
+    }
+
+    __syncthreads();
+
+    float s, c;
+    sincosf(timeShiftsArray[local_y][local_x], &s, &c);
+    phasorReal_half[local_y][local_x] = __float2half(c);
+    phasorImag_half[local_y][local_x] = __float2half(-s);
+
+    const int M = ROTATE_BLOCK_DIM_Y;
+    const int N = ROTATE_BLOCK_DIM_X;
+    const int K = ROTATE_BLOCK_DIM_X;
+
+    wmma::fragment<wmma::matrix_a, M, N, K, half, wmma::row_major> input_real_frag, input_imag_frag;
+    wmma::fragment<wmma::matrix_b, M, N, K, half, wmma::col_major> phasor_real_frag, phasor_imag_frag;
+    wmma::fragment<wmma::accumulator, M, N, K, half> output_real_frag, output_imag_frag;
+
+    wmma::load_matrix_sync(input_real_frag, &inputReal_half[0][0], K);
+    wmma::load_matrix_sync(input_imag_frag, &inputImag_half[0][0], K);
+    wmma::load_matrix_sync(phasor_real_frag, &phasorReal_half[0][0], N);
+    wmma::load_matrix_sync(phasor_imag_frag, &phasorImag_half[0][0], N);
+
+    wmma::fill_fragment(output_real_frag, 0.0f);
+    wmma::fill_fragment(output_imag_frag, 0.0f);
+
+    wmma::mma_sync(output_real_frag, input_real_frag, phasor_real_frag, output_real_frag);
+    wmma::mma_sync(output_real_frag, input_imag_frag, phasor_imag_frag, output_real_frag);
+    wmma::mma_sync(output_imag_frag, input_real_frag, phasor_imag_frag, output_imag_frag);
+    wmma::mma_sync(output_imag_frag, input_imag_frag, phasor_real_frag, output_imag_frag);
+
+    __shared__ half result_real[M * N];
+    __shared__ half result_imag[M * N];
+    wmma::store_matrix_sync(result_real, output_real_frag, N, wmma::mem_row_major);
+    wmma::store_matrix_sync(result_imag, output_imag_frag, N, wmma::mem_row_major);
+
+    for (int i = 0; i < M; ++i) {
+        for (int j = 0; j < N; ++j) {
+            output[i][j].x = __half2float(result_real[i * N + j]);
+            output[i][j].y = __half2float(result_imag[i * N + j]);
+        }
+    }
+
+    if (global_x < nsamps && global_y < nchans) {
+        outputData[global_y * nsamps + global_x] = output[local_y][local_x];
+    }
+}
+
 
 __global__ void unoptimised_rotate_spectrum_smem_32_square(float2* inputData, float2* outputData, long nsamps, long nchans, float DMstart, float DMstep){
     int local_x = threadIdx.x;
@@ -713,6 +794,28 @@ int main(int argc, char *argv[]) {
             printf("CUDA error 2: %s\n", cudaGetErrorString(error));
             return 1;
         }
+
+        // begin timer
+        cudaEvent_t startKernel_tensor_core, stopKernel_tensor_core;
+        cudaEventCreate(&startKernel_tensor_core);
+        cudaEventCreate(&stopKernel_tensor_core);
+        cudaEventRecord(startKernel_tensor_core, 0);
+
+
+        // use tensor core kernel to rotate the spectrum
+        dim3 dimBlockRotation_tensor_core(ROTATE_BLOCK_DIM_X, ROTATE_BLOCK_DIM_Y);
+        dim3 dimGridRotation_tensor_core((header.paddedLength + dimBlockRotation_tensor_core.x - 1) / dimBlockRotation_tensor_core.x, (header.nchans + dimBlockRotation_tensor_core.y - 1) / dimBlockRotation_tensor_core.y);
+        tensor_core_rotate_spectrum_smem_32_square<<<dimGridRotation_tensor_core, dimBlockRotation_tensor_core>>>(deviceData_float2_raw, deviceData_float2_dedispersed, (header.paddedLength/2) + 1, header.nchans, DM, DM_step);
+        cudaDeviceSynchronize();
+
+        // stop timing
+        cudaEventRecord(stopKernel_tensor_core, 0);
+        cudaEventSynchronize(stopKernel_tensor_core);
+        float elapsedTime_tensor_core;
+        cudaEventElapsedTime(&elapsedTime_tensor_core, startKernel_tensor_core, stopKernel_tensor_core);
+        printf("Rotation kernel (tensor core implementation, %d DMs) time:\t%lf s\n", ROTATE_BLOCK_DIM_Y, elapsedTime_tensor_core / 1000.0);
+
+
 
 
 
