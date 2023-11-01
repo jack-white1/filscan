@@ -6,6 +6,9 @@
 #include <cuda_runtime.h>
 #include <cufft.h>
 
+#define ROTATE_BLOCK_DIM_X 32
+#define ROTATE_BLOCK_DIM_Y 32
+
 struct header {
     const char *fileName;
     long fileSize;
@@ -434,48 +437,54 @@ __global__ void unoptimised_rotate_spectrum_smem_32_square(float2* inputData, fl
     int global_x = blockIdx.x * blockDim.x + threadIdx.x;
     int global_y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    // blockDim.x = blockDim.y = 32
+    __shared__ float2 output[ROTATE_BLOCK_DIM_Y][ROTATE_BLOCK_DIM_X];
 
-    __shared__ float2 input[32][32];
-    __shared__ float2 intermediate[32][32];
-    __shared__ float2 output[32][32];
-
-    // copy data from global memory to shared memory
-
+    float2 inputDataPoint;
     if (global_x < nsamps && global_y < nchans){
-        input[local_y][local_x] = inputData[global_y * nsamps + global_x];
+        inputDataPoint = inputData[global_y * nsamps + global_x];
     }
-    __syncthreads();
-
+    
     // set output to 0
     output[local_y][local_x].x = 0.0f;
     output[local_y][local_x].y = 0.0f;
 
+    float cachedTimeShiftPerDM = cachedTimeShiftsPerDM[global_y];
+    float2 intermediate_value;
     float DM = DMstart;
-    for (int DM_idx = 0; DM_idx < 32; DM_idx++){
-        float phase = global_x * DM * cachedTimeShiftsPerDM[global_y];
-        float2 input_value = input[local_y][local_x];
-        float2 intermediate_value;
+    float phase;
+    for (int DM_idx = 0; DM_idx < ROTATE_BLOCK_DIM_Y; DM_idx++){
+        phase = global_x * DM * cachedTimeShiftPerDM;
+        if (global_x < 10 && global_y == 10){
+            printf("global_x: %d, phase: %f, DM: %f\n", global_x, phase, DM);
+        }
         float s, c;
         sincosf(phase, &s, &c); 
-        intermediate_value.x = input_value.x * c - input_value.y * s;
-        intermediate_value.y = input_value.x * s + input_value.y * c;
-        intermediate[local_y][local_x] = intermediate_value;
-
+        intermediate_value.x = fmaf(inputDataPoint.x, c, -inputDataPoint.y * s);
+        intermediate_value.y = fmaf(inputDataPoint.x, s, inputDataPoint.y * c);
         __syncthreads();
+        
+        // Start the hierarchical reduction across the y-axis using warp-level primitives
+        unsigned mask = __ballot_sync(0xFFFFFFFF, 1);
+       
+        // Loop unrolling for strides: 16, 8, 4, 2, and 1
+        intermediate_value.x += __shfl_down_sync(mask, intermediate_value.x, 16);
+        intermediate_value.y += __shfl_down_sync(mask, intermediate_value.y, 16);
 
-        // Hierarchical reduction across the y axis
-        for (int stride = 16; stride > 0; stride /= 2) {
-            if (local_y < stride) {
-                intermediate[local_y][local_x].x += intermediate[local_y + stride][local_x].x;
-                intermediate[local_y][local_x].y += intermediate[local_y + stride][local_x].y;
-            }
-            __syncthreads();
-        }
+        intermediate_value.x += __shfl_down_sync(mask, intermediate_value.x, 8);
+        intermediate_value.y += __shfl_down_sync(mask, intermediate_value.y, 8);
 
-        // write to output shared memory array
+        intermediate_value.x += __shfl_down_sync(mask, intermediate_value.x, 4);
+        intermediate_value.y += __shfl_down_sync(mask, intermediate_value.y, 4);
+
+        intermediate_value.x += __shfl_down_sync(mask, intermediate_value.x, 2);
+        intermediate_value.y += __shfl_down_sync(mask, intermediate_value.y, 2);
+
+        intermediate_value.x += __shfl_down_sync(mask, intermediate_value.x, 1);
+        intermediate_value.y += __shfl_down_sync(mask, intermediate_value.y, 1);
+
+        // Write the final reduced value to output shared memory array
         if (local_y == 0){
-            output[DM_idx][local_x] = intermediate[0][local_x];
+            output[DM_idx][local_x] = intermediate_value;
         }
 
         DM += DMstep;
@@ -486,7 +495,6 @@ __global__ void unoptimised_rotate_spectrum_smem_32_square(float2* inputData, fl
     if (global_x < nsamps && global_y < nchans){
         outputData[global_y * nsamps + global_x] = output[local_y][local_x];
     }
-    __syncthreads();
 }
 
 // 4096 channels means 128 blocks of 32 DMs, this kernel should take the Nth DM from each block and sum them
@@ -686,9 +694,10 @@ int main(int argc, char *argv[]) {
         cudaEventRecord(startKernel_smem, 0);
 
         // rotate the spectrum using smem version
-        dim3 dimBlockRotation_smem(32, 32);
+        dim3 dimBlockRotation_smem(ROTATE_BLOCK_DIM_X, ROTATE_BLOCK_DIM_Y);
+        //dim3 dimBlockRotation_smem(32, 32); 
         dim3 dimGridRotation_smem((header.paddedLength + dimBlockRotation_smem.x - 1) / dimBlockRotation_smem.x, (header.nchans + dimBlockRotation_smem.y - 1) / dimBlockRotation_smem.y);
-        unoptimised_rotate_spectrum_smem_32_square<<<dimGridRotation_smem, dimBlockRotation_smem, 3 * 32 * 32 * sizeof(float2)>>>(deviceData_float2_raw, deviceData_float2_dedispersed, (header.paddedLength/2) + 1, header.nchans, DM, DM_step);
+        unoptimised_rotate_spectrum_smem_32_square<<<dimGridRotation_smem, dimBlockRotation_smem>>>(deviceData_float2_raw, deviceData_float2_dedispersed, (header.paddedLength/2) + 1, header.nchans, DM, DM_step);
         cudaDeviceSynchronize();
 
         // stop timing
@@ -696,7 +705,7 @@ int main(int argc, char *argv[]) {
         cudaEventSynchronize(stopKernel_smem);
         float elapsedTime_smem;
         cudaEventElapsedTime(&elapsedTime_smem, startKernel_smem, stopKernel_smem);
-        printf("Rotation kernel (smem implementation, 32 DMs) time:\t\t%lf s\n", elapsedTime_smem / 1000.0);
+        printf("Rotation kernel (smem implementation, %d DMs) time:\t\t%lf s\n", ROTATE_BLOCK_DIM_Y, elapsedTime_smem / 1000.0);
 
         // check cuda error
         error = cudaGetLastError();
