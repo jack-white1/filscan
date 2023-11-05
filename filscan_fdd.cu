@@ -435,6 +435,9 @@ __global__ void rotate_spectrum_smem_32_square(
 }
 
 __global__ void tensor_core_rotate_spectrum_smem_32_square(float2* inputData, float2* outputData, long nsamps, long nchans, float DMstart, float DMstep) {
+    clock_t start, stop;
+    start = clock64();
+    
     int local_x = threadIdx.x;
     int local_y = threadIdx.y;
     int global_x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -450,28 +453,55 @@ __global__ void tensor_core_rotate_spectrum_smem_32_square(float2* inputData, fl
     __shared__ half phasorReal_half[ROTATE_BLOCK_DIM_Y][ROTATE_BLOCK_DIM_X];
     __shared__ half phasorImag_half[ROTATE_BLOCK_DIM_Y][ROTATE_BLOCK_DIM_X];
 
+    //__syncthreads();
+    //stop = clock64();
+    //if (global_x == 0 && global_y == 0)
+    //printf("Clock cycles to initialise shared memory: %ld\n", stop - start);
+    //start = clock64();
+
     if (global_x < nsamps && global_y < nchans) {
         inputReal_half[local_y][local_x] = __float2half(inputData[global_y * nsamps + global_x].x);
         inputImag_half[local_y][local_x] = __float2half(inputData[global_y * nsamps + global_x].y);
     }
     
+    //__syncthreads();
+    //stop = clock64();
+    //if (global_x == 0 && global_y == 0)
+    //printf("Clock cycles to load data from global memory to shared memory: %ld\n", stop - start);
+    //start = clock64();
+
     output[local_y][local_x].x = 0.0f;
     output[local_y][local_x].y = 0.0f;
 
-    if (local_x == 0 && local_y == 0) {
-        for(int i = 0; i < ROTATE_BLOCK_DIM_Y; i++) {
-            for(int j = 0; j < ROTATE_BLOCK_DIM_X; j++) {
-                timeShiftsArray[i][j] = first_thread_in_block_x * (DMstart + j * DMstep) * cachedTimeShiftsPerDM[global_y + i];
-            }
-        }
-    }
+    // single thread version
 
-    __syncthreads();
+    //if (local_x == 0 && local_y == 0) {
+    //    for(int i = 0; i < ROTATE_BLOCK_DIM_Y; i++) {
+    //        for(int j = 0; j < ROTATE_BLOCK_DIM_X; j++) {
+    //            timeShiftsArray[i][j] = first_thread_in_block_x * (DMstart + j * DMstep) * cachedTimeShiftsPerDM[global_y + i];
+    //        }
+    //    }
+    //}
+
+    // threadblock version
+    timeShiftsArray[local_y][local_x] = first_thread_in_block_x * (DMstart + local_x * DMstep) * cachedTimeShiftsPerDM[global_y + local_y];
+
+    //__syncthreads();
+    //stop = clock64();
+    //if (global_x == 0 && global_y == 0)
+    //printf("Clock cycles to compute time shifts: %ld\n", stop - start);
+    //start = clock64();
 
     float s, c;
     sincosf(timeShiftsArray[local_y][local_x], &s, &c);
     phasorReal_half[local_y][local_x] = __float2half(c);
     phasorImag_half[local_y][local_x] = __float2half(-s);
+
+    //__syncthreads();
+    //stop = clock64();
+    //if (global_x == 0 && global_y == 0)
+    //printf("Clock cycles to compute phasors: %ld\n", stop - start);
+    //start = clock64();
 
     const int M = ROTATE_BLOCK_DIM_Y;
     const int N = ROTATE_BLOCK_DIM_X;
@@ -486,33 +516,63 @@ __global__ void tensor_core_rotate_spectrum_smem_32_square(float2* inputData, fl
     wmma::load_matrix_sync(phasor_real_frag, &phasorReal_half[0][0], N);
     wmma::load_matrix_sync(phasor_imag_frag, &phasorImag_half[0][0], N);
 
+
+    //__syncthreads();
+    //stop = clock64();
+    //if (global_x == 0 && global_y == 0)
+    //printf("Clock cycles to load data into fragments: %ld\n", stop - start);
+    //start = clock64();
+
     wmma::fill_fragment(output_real_frag, 0.0f);
     wmma::fill_fragment(output_imag_frag, 0.0f);
+
+    //__syncthreads();
+    //stop = clock64();
+    //if (global_x == 0 && global_y == 0)
+    //printf("Clock cycles to fill fragments: %ld\n", stop - start);
+    //start = clock64();
 
     wmma::mma_sync(output_real_frag, input_real_frag, phasor_real_frag, output_real_frag);
     wmma::mma_sync(output_real_frag, input_imag_frag, phasor_imag_frag, output_real_frag);
     wmma::mma_sync(output_imag_frag, input_real_frag, phasor_imag_frag, output_imag_frag);
     wmma::mma_sync(output_imag_frag, input_imag_frag, phasor_real_frag, output_imag_frag);
 
+    //__syncthreads();
+    //stop = clock64();
+    //if (global_x == 0 && global_y == 0)
+    //printf("Clock cycles to perform matrix multiply: %ld\n", stop - start);
+    //start = clock64();
+
     __shared__ half result_real[M * N];
     __shared__ half result_imag[M * N];
     wmma::store_matrix_sync(result_real, output_real_frag, N, wmma::mem_row_major);
     wmma::store_matrix_sync(result_imag, output_imag_frag, N, wmma::mem_row_major);
 
-    for (int i = 0; i < M; ++i) {
-        for (int j = 0; j < N; ++j) {
-            output[i][j].x = __half2float(result_real[i * N + j]);
-            output[i][j].y = __half2float(result_imag[i * N + j]);
-        }
-    }
+    //__syncthreads();
+    //stop = clock64();
+    //if (global_x == 0 && global_y == 0)
+    //printf("Clock cycles to store data from fragments to shared memory: %ld\n", stop - start);
+    //start = clock64();
+
+
+    output[local_y][local_x].x = __half2float(result_real[local_y * N + local_x]);
+    output[local_y][local_x].y = __half2float(result_imag[local_y * N + local_x]);
 
     if (global_x < nsamps && global_y < nchans) {
         outputData[global_y * nsamps + global_x] = output[local_y][local_x];
     }
+
+    __syncthreads();
+    stop = clock64();
+    if (global_x == 0 && global_y == 0)
+    printf("Clock cycles for tensor core kernel: %ld\n", stop - start);
 }
 
 
 __global__ void unoptimised_rotate_spectrum_smem_32_square(float2* inputData, float2* outputData, long nsamps, long nchans, float DMstart, float DMstep){
+    clock_t start, stop;
+    start = clock64();
+
     int local_x = threadIdx.x;
     int local_y = threadIdx.y;
     int global_x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -535,9 +595,9 @@ __global__ void unoptimised_rotate_spectrum_smem_32_square(float2* inputData, fl
     float phase;
     for (int DM_idx = 0; DM_idx < ROTATE_BLOCK_DIM_Y; DM_idx++){
         phase = global_x * DM * cachedTimeShiftPerDM;
-        if (global_x < 10 && global_y == 10){
-            printf("global_x: %d, phase: %f, DM: %f\n", global_x, phase, DM);
-        }
+        //if (global_x < 10 && global_y == 10){
+        //    printf("global_x: %d, phase: %f, DM: %f\n", global_x, phase, DM);
+        //}
         float s, c;
         sincosf(phase, &s, &c); 
         intermediate_value.x = fmaf(inputDataPoint.x, c, -inputDataPoint.y * s);
@@ -576,6 +636,10 @@ __global__ void unoptimised_rotate_spectrum_smem_32_square(float2* inputData, fl
     if (global_x < nsamps && global_y < nchans){
         outputData[global_y * nsamps + global_x] = output[local_y][local_x];
     }
+
+    stop = clock64();
+    if (global_x == 0 && global_y == 0)
+    printf("Clock cycles to perform unoptimised kernel: %ld\n", stop - start);
 }
 
 // 4096 channels means 128 blocks of 32 DMs, this kernel should take the Nth DM from each block and sum them
@@ -814,11 +878,6 @@ int main(int argc, char *argv[]) {
         float elapsedTime_tensor_core;
         cudaEventElapsedTime(&elapsedTime_tensor_core, startKernel_tensor_core, stopKernel_tensor_core);
         printf("Rotation kernel (tensor core implementation, %d DMs) time:\t%lf s\n", ROTATE_BLOCK_DIM_Y, elapsedTime_tensor_core / 1000.0);
-
-
-
-
-
 
 
         // time the kernel

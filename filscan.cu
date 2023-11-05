@@ -6,6 +6,9 @@
 #include <cuda_runtime.h>
 #include <cufft.h>
 
+#define RADIUSBLOCKX 32
+#define RADIUSBLOCKY 32
+
 struct header {
     const char *fileName;
     long fileSize;
@@ -356,6 +359,52 @@ __global__ void copy_uint8_t_array_to_float(uint8_t* input, float* output, long 
     }
 }
 
+__global__ void extract_radii(float2* input, float2* output, long nchans, long nsamps, int numAngles, double maxAngle){
+    long global_x = blockIdx.x * blockDim.x + threadIdx.x;
+    long global_y = blockIdx.y * blockDim.y + threadIdx.y;
+    int local_x = threadIdx.x;
+    int local_y = threadIdx.y;
+
+    __shared__ float2 shared_input[RADIUSBLOCKX][RADIUSBLOCKY];
+
+    if (global_x < nsamps && global_y < nchans) {
+        shared_input[local_x][local_y] = input[global_y * nsamps + global_x];
+    }
+
+    __syncthreads();
+
+    int top_left_x = blockIdx.x * blockDim.x;
+    int top_left_y = blockIdx.y * blockDim.y;
+
+    int bottom_right_x = top_left_x + blockDim.x;
+    int bottom_right_y = top_left_y + blockDim.y;
+
+    double upper_angle = atan2((double)nchans - (double)top_left_y, (double)top_left_x);
+    double lower_angle = atan2((double)nchans - (double)bottom_right_y, (double)bottom_right_x);
+    
+    double angle_step = maxAngle / (double)numAngles;
+
+    double max_angle_index = floor(upper_angle / angle_step);
+    double min_angle_index = ceil(lower_angle / angle_step);
+
+    if (max_angle_index - min_angle_index >= 1.0) {
+        if (local_x == 0 && local_y == 0){
+            printf("upper_angle: %lf, lower_angle: %lf, global_x: %ld, global_y: %ld, nchans: %ld, top_left_x: %d, top_left_y: %d, bottom_right_x: %d, bottom_right_y: %d, max_angle_index - min_angle_index: %lf\n", upper_angle, lower_angle, global_x, global_y, nchans, top_left_x, top_left_y, bottom_right_x, bottom_right_y, max_angle_index - min_angle_index);
+        }
+    }
+
+    for (double angle_index = min_angle_index; angle_index < max_angle_index; angle_index++){
+        // each thread has to figure out if its on the line
+        // if it is, then it writes to the output array
+        // the x index in the output array is the global x index
+        // the row index of the output array is the angle index
+
+        // depending on bresenhams vs xialin wu, the add into the output array
+        // should either be a solitary or atomic add
+
+    }
+}
+
 const char* filscan_frame = 
 
 "   ______________ __                    \n"
@@ -613,6 +662,14 @@ int main(int argc, char *argv[]) {
             fprintf(csvFile4, "%d,%d,%lf\n", i, j, sqrt(stretchedDataFFTHost[i * (1+header.paddedLength/2) + j].x * stretchedDataFFTHost[i * (1+header.paddedLength/2) + j].x + stretchedDataFFTHost[i * (1+header.paddedLength/2) + j].y * stretchedDataFFTHost[i * (1+header.paddedLength/2) + j].y));
         }
     }
+
+
+    // call extractradii kernel
+    dim3 dimBlock4(RADIUSBLOCKX, RADIUSBLOCKY);
+    dim3 dimGrid4((header.paddedLength + dimBlock4.x - 1) / dimBlock4.x, (numChannelsStretchedPadded + dimBlock4.y - 1) / dimBlock4.y);
+    extract_radii<<<dimGrid4, dimBlock4>>>(stretchedDataFFT, stretchedDataFFT, numChannelsStretchedPadded, header.paddedLength, 1000, 1.57);
+    cudaDeviceSynchronize();
+
 
 
 
